@@ -30,7 +30,7 @@ fn init_writes_the_plugin_beside_the_marketplace() {
     .expect("parse marketplace");
     assert_eq!(
         marketplace.pointer("/plugins/0/source/path"),
-        Some(&json!("./.agents/plugins/plugins/example-plugin"))
+        Some(&json!("./plugins/example-plugin"))
     );
     validate_path(&repository).expect("validate repository marketplace");
 
@@ -181,7 +181,7 @@ fn marketplace_install_extracts_a_verified_pages_bundle_into_the_repository() {
     let destination_repository = temporary_repository("market-destination");
     fs::create_dir_all(&destination_repository).expect("create destination repository");
     let receipt =
-        install_marketplace_bundle(&destination_repository, "market-plugin", "1.0.0", &archive)
+        install_marketplace_bundle(&destination_repository, "market-plugin", "0.1.0", &archive)
             .expect("install pages bundle");
     assert_eq!(receipt["installed"], true);
     assert_eq!(receipt["source"], "independent-pages-or-worker");
@@ -194,4 +194,61 @@ fn marketplace_install_extracts_a_verified_pages_bundle_into_the_repository() {
 
     fs::remove_dir_all(source_repository).expect("remove source repository");
     fs::remove_dir_all(destination_repository).expect("remove destination repository");
+}
+
+#[test]
+fn marketplace_install_rejects_manifest_version_mismatch() {
+    let source_repository = temporary_repository("market-version-source");
+    init_repository(
+        &source_repository,
+        "Versioned Plugin",
+        Some("版本插件"),
+        PluginTemplate::Conversational,
+    )
+    .expect("initialize source plugin");
+    let source_plugin = source_repository.join(".agents/plugins/plugins/versioned-plugin");
+    let archive = codex_core_plugins::plugin_bundle_archive::pack_plugin_bundle_tar_gz(
+        &source_plugin,
+        50 * 1024 * 1024,
+    )
+    .expect("pack plugin");
+    let destination_repository = temporary_repository("market-version-destination");
+    fs::create_dir_all(&destination_repository).expect("create destination repository");
+
+    let error = install_marketplace_bundle(
+        &destination_repository,
+        "versioned-plugin",
+        "9.9.9",
+        &archive,
+    )
+    .expect_err("reject mismatched version");
+    assert!(error.contains("插件包版本 0.1.0 与市场版本 9.9.9 不一致"));
+    assert!(
+        !destination_repository
+            .join(".agents/plugins/plugins/versioned-plugin")
+            .exists()
+    );
+
+    fs::remove_dir_all(source_repository).expect("remove source repository");
+    fs::remove_dir_all(destination_repository).expect("remove destination repository");
+}
+
+#[test]
+fn marketplace_mini_apps_discovers_installed_plugin_from_marketplace_root() {
+    let repository = temporary_repository("market-miniapps");
+    init_repository(
+        &repository,
+        "Runnable Plugin",
+        Some("可运行插件"),
+        PluginTemplate::Conversational,
+    )
+    .expect("initialize plugin");
+
+    let mini_apps = marketplace_mini_apps(&repository.join(".agents/plugins"))
+        .expect("discover marketplace mini apps");
+    assert_eq!(mini_apps.len(), 1);
+    assert_eq!(mini_apps[0]["pluginId"], "runnable-plugin");
+    assert_eq!(mini_apps[0]["title"], "可运行插件");
+
+    fs::remove_dir_all(repository).expect("remove test repository");
 }

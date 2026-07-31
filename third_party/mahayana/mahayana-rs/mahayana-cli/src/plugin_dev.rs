@@ -84,6 +84,19 @@ pub fn install_marketplace_bundle(
     let result = (|| {
         unpack_plugin_bundle_tar_gz(archive, &staging, 100 * 1024 * 1024)
             .map_err(|error| error.to_string())?;
+        let plugin = LocalPlugin::load(&staging).map_err(|error| error.to_string())?;
+        if plugin.codex.name != plugin_id {
+            return Err(format!(
+                "插件包标识 {} 与市场条目 {plugin_id} 不一致",
+                plugin.codex.name
+            ));
+        }
+        if plugin.codex.version.as_deref() != Some(version) {
+            return Err(format!(
+                "插件包版本 {} 与市场版本 {version} 不一致",
+                plugin.codex.version.as_deref().unwrap_or("<missing>")
+            ));
+        }
         let validation = validate_plugin(&staging)?;
         fs::rename(&staging, &destination).map_err(|error| error.to_string())?;
         update_marketplace(
@@ -123,6 +136,13 @@ pub fn prepare_site_distribution(
         ));
     }
     let distribution = plugin_path.join(SITE_DISTRIBUTION_DIR);
+    if distribution.exists() {
+        fs::remove_dir_all(&distribution).map_err(|error| error.to_string())?;
+    }
+    let ui = plugin_path.join("ui");
+    if ui.is_dir() {
+        copy_site_tree(&ui, &distribution)?;
+    }
     let mahayana = distribution.join("mahayana");
     fs::create_dir_all(&mahayana).map_err(|error| error.to_string())?;
     fs::write(mahayana.join("plugin.tar.gz"), archive).map_err(|error| error.to_string())?;
@@ -199,6 +219,26 @@ fn deployment_url_from_output(output: &str) -> Option<String> {
         url.set_path(&path);
         Some(url.to_string().trim_end_matches('/').to_string())
     })
+}
+
+fn copy_site_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let target = destination.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            copy_site_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target).map_err(|error| error.to_string())?;
+        } else {
+            return Err(format!(
+                "unsupported plugin web asset: {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn escape_html(value: &str) -> String {
@@ -385,7 +425,10 @@ pub fn validate_path(path: &Path) -> Result<Value, String> {
     let mut reports = Vec::new();
     for entry in entries {
         let relative = validate_marketplace_entry(entry)?;
-        reports.push(validate_plugin(&resolve_relative(&path, relative)?)?);
+        reports.push(validate_plugin(&resolve_relative(
+            marketplace_path.parent().expect("marketplace parent"),
+            relative,
+        )?)?);
     }
     Ok(json!({
         "valid":true,
@@ -412,7 +455,14 @@ pub fn test_path(path: &Path) -> Result<Value, String> {
             .ok_or_else(|| "marketplace plugins must be an array".to_string())?
             .iter()
             .map(validate_marketplace_entry)
-            .map(|relative| relative.and_then(|relative| resolve_relative(&path, relative)))
+            .map(|relative| {
+                relative.and_then(|relative| {
+                    resolve_relative(
+                        marketplace_path.parent().expect("marketplace parent"),
+                        relative,
+                    )
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?
     };
 
@@ -656,6 +706,51 @@ fn validate_marketplace_entry(entry: &Value) -> Result<&str, String> {
         .ok_or_else(|| format!("marketplace plugin {name} requires source.path"))
 }
 
+pub fn marketplace_mini_apps(marketplace_root: &Path) -> Result<Vec<Value>, String> {
+    let marketplace_path = marketplace_root.join("marketplace.json");
+    let marketplace: Value = serde_json::from_str(
+        &fs::read_to_string(&marketplace_path)
+            .map_err(|error| format!("failed to read {}: {error}", marketplace_path.display()))?,
+    )
+    .map_err(|error| format!("invalid marketplace: {error}"))?;
+    let entries = marketplace
+        .get("plugins")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "marketplace plugins must be an array".to_string())?;
+    let mut mini_apps = Vec::new();
+    for entry in entries {
+        let relative = validate_marketplace_entry(entry)?;
+        let plugin_root = resolve_relative(marketplace_root, relative)?;
+        let manifest_path = plugin_root.join(".codex-plugin/plugin.json");
+        let manifest: Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path)
+                .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?,
+        )
+        .map_err(|error| {
+            format!(
+                "invalid plugin manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+        let plugin_id = manifest
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{} is missing name", manifest_path.display()))?;
+        let title = manifest
+            .pointer("/interface/displayName")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(plugin_id);
+        mini_apps.push(json!({
+            "pluginId": plugin_id,
+            "title": title,
+            "pinned": false,
+        }));
+    }
+    Ok(mini_apps)
+}
+
 fn update_marketplace(path: &Path, name: &str) -> Result<(), String> {
     let mut marketplace = if path.is_file() {
         serde_json::from_str::<Value>(&fs::read_to_string(path).map_err(|error| error.to_string())?)
@@ -675,7 +770,7 @@ fn update_marketplace(path: &Path, name: &str) -> Result<(), String> {
     }
     plugins.push(json!({
         "name":name,
-        "source":{"source":"local","path":format!("./.agents/plugins/plugins/{name}")},
+        "source":{"source":"local","path":format!("./plugins/{name}")},
         "policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},
         "category":"Productivity"
     }));

@@ -198,7 +198,15 @@ enum MarketplaceCommand {
     Search {
         query: String,
     },
-    /// Download an approved plugin from its independent Pages/Worker site.
+    /// Download an approved plugin archive after exact version, size, and SHA-256 verification.
+    Download {
+        plugin_id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+    },
+    /// Download, verify, and safely install an approved plugin.
     Install {
         plugin_id: String,
         #[arg(long)]
@@ -502,59 +510,150 @@ fn capability_command(runtime: &RuntimeHandle, command: CapabilityCommand) -> Re
     }
 }
 
+struct VerifiedMarketplaceArchive {
+    version: String,
+    package_sha256: String,
+    package_size: u64,
+    archive: Vec<u8>,
+}
+
+fn verified_marketplace_archive(
+    client: &MahayanaProductClient,
+    plugin_id: &str,
+    requested_version: Option<&str>,
+) -> Result<VerifiedMarketplaceArchive, String> {
+    let listing = client
+        .marketplace_browse(Some(plugin_id), Some("cli"))
+        .map_err(|error| error.to_string())?;
+    let plugin = listing
+        .get("plugins")
+        .and_then(Value::as_array)
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .find(|plugin| plugin.get("pluginId").and_then(Value::as_str) == Some(plugin_id))
+        })
+        .ok_or_else(|| format!("市场中没有已审核插件 {plugin_id}"))?;
+    let version = requested_version
+        .map(str::to_string)
+        .or_else(|| {
+            plugin
+                .get("latestVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| "市场条目没有可下载版本".to_string())?;
+    let metadata = client
+        .marketplace_release_metadata(plugin_id, &version)
+        .map_err(|error| error.to_string())?;
+    if metadata.get("pluginId").and_then(Value::as_str) != Some(plugin_id)
+        || metadata.get("version").and_then(Value::as_str) != Some(version.as_str())
+    {
+        return Err("市场版本元数据与请求的插件或版本不一致".into());
+    }
+    let expected_sha256 = metadata
+        .get("packageSha256")
+        .and_then(Value::as_str)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "市场版本元数据缺少有效 packageSha256".to_string())?
+        .to_ascii_lowercase();
+    let expected_size = metadata
+        .get("packageSize")
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0 && *size <= 50 * 1024 * 1024)
+        .ok_or_else(|| "市场版本元数据缺少有效 packageSize".to_string())?;
+    let archive = client
+        .download_marketplace_plugin(
+            plugin_id,
+            &version,
+            usize::try_from(expected_size)
+                .map_err(|_| "市场插件包大小超出当前平台限制".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    if archive.len() as u64 != expected_size {
+        return Err("下载的插件包大小与市场版本元数据不一致".into());
+    }
+    let actual_sha256 = format!("{:x}", Sha256::digest(&archive));
+    if actual_sha256 != expected_sha256 {
+        return Err("云端插件包哈希与市场版本元数据不一致".into());
+    }
+    Ok(VerifiedMarketplaceArchive {
+        version,
+        package_sha256: actual_sha256,
+        package_size: expected_size,
+        archive,
+    })
+}
+
 fn marketplace_command(command: MarketplaceCommand) -> Result<(), String> {
     let client = MahayanaProductClient::default();
-    let response = match command {
-        MarketplaceCommand::Browse => client.marketplace_browse(None, Some("desktop")),
+    match command {
+        MarketplaceCommand::Browse => {
+            let response = client
+                .marketplace_browse(None, Some("cli"))
+                .map_err(|error| error.to_string())?;
+            print_json(&response)
+        }
         MarketplaceCommand::Search { query } => {
-            client.marketplace_browse(Some(&query), Some("desktop"))
+            let response = client
+                .marketplace_browse(Some(&query), Some("cli"))
+                .map_err(|error| error.to_string())?;
+            print_json(&response)
+        }
+        MarketplaceCommand::Download {
+            plugin_id,
+            version,
+            output,
+        } => {
+            let verified = verified_marketplace_archive(&client, &plugin_id, version.as_deref())?;
+            let output = output.unwrap_or_else(|| {
+                PathBuf::from(format!("{plugin_id}-{}.tar.gz", verified.version))
+            });
+            if let Some(parent) = output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        format!("拒绝覆盖已存在的下载文件 {}", output.display())
+                    } else {
+                        error.to_string()
+                    }
+                })?;
+            if let Err(error) = file.write_all(&verified.archive) {
+                drop(file);
+                let _ = fs::remove_file(&output);
+                return Err(error.to_string());
+            }
+            print_json(&json!({
+                "downloaded": true,
+                "pluginId": plugin_id,
+                "version": verified.version,
+                "packageSha256": verified.package_sha256,
+                "packageSize": verified.package_size,
+                "output": output,
+            }))
         }
         MarketplaceCommand::Install {
             plugin_id,
             version,
             repository,
         } => {
-            let listing = client
-                .marketplace_browse(Some(&plugin_id), Some("desktop"))
-                .map_err(|error| error.to_string())?;
-            let plugin = listing
-                .get("plugins")
-                .and_then(Value::as_array)
-                .and_then(|plugins| {
-                    plugins.iter().find(|plugin| {
-                        plugin.get("pluginId").and_then(Value::as_str) == Some(&plugin_id)
-                    })
-                })
-                .ok_or_else(|| format!("市场中没有已审核插件 {plugin_id}"))?;
-            let version = version
-                .or_else(|| {
-                    plugin
-                        .get("latestVersion")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .ok_or_else(|| "市场条目没有可安装版本".to_string())?;
-            let expected_sha256 = plugin
-                .get("packageSha256")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "市场条目缺少 packageSha256".to_string())?;
-            let archive = client
-                .download_marketplace_plugin(&plugin_id, &version, 50 * 1024 * 1024)
-                .map_err(|error| error.to_string())?;
-            let actual_sha256 = format!("{:x}", Sha256::digest(&archive));
-            if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
-                return Err("Pages/Worker 插件包哈希与市场回执不一致".into());
-            }
-            return print_json(&plugin_dev::install_marketplace_bundle(
+            let verified = verified_marketplace_archive(&client, &plugin_id, version.as_deref())?;
+            print_json(&plugin_dev::install_marketplace_bundle(
                 &repository,
                 &plugin_id,
-                &version,
-                &archive,
-            )?);
+                &verified.version,
+                &verified.archive,
+            )?)
         }
     }
-    .map_err(|error| error.to_string())?;
-    print_json(&response)
 }
 
 fn model_usage_command() -> Result<(), String> {
@@ -600,7 +699,7 @@ fn plugin_command(
         }
         PluginCommand::Info { plugin_id } => {
             let response = MahayanaProductClient::default()
-                .marketplace_browse(Some(&plugin_id), Some("desktop"))
+                .marketplace_browse(Some(&plugin_id), Some("cli"))
                 .map_err(|error| error.to_string())?;
             print_json(&response)
         }
@@ -695,7 +794,7 @@ fn plugin_command(
             if !arguments.is_object() {
                 return Err("--json 必须是 MCP Tool 参数对象".into());
             }
-            let message = format!("/{command} {arguments}");
+            let message = format!("/{plugin_id}:{command} {arguments}");
             with_runtime(codex_executable_path, |runtime| {
                 send_and_stream(runtime, &format!("miniapp:{plugin_id}"), &message)
             })
@@ -719,7 +818,19 @@ fn plugin_command(
             deployment_url,
         } => {
             let path = plugin_dev::absolute_path(&path)?;
-            LocalPlugin::load(&path).map_err(|error| error.to_string())?;
+            let plugin = LocalPlugin::load(&path).map_err(|error| error.to_string())?;
+            if plugin.codex.name != plugin_id {
+                return Err(format!(
+                    "插件清单标识 {} 与发布参数 {plugin_id} 不一致",
+                    plugin.codex.name
+                ));
+            }
+            if plugin.codex.version.as_deref() != Some(version.as_str()) {
+                return Err(format!(
+                    "插件清单版本 {} 与发布参数 {version} 不一致",
+                    plugin.codex.version.as_deref().unwrap_or("<missing>")
+                ));
+            }
             plugin_dev::test_path(&path)?;
             let archive = pack_plugin_bundle_tar_gz(&path, 50 * 1024 * 1024)
                 .map_err(|error| error.to_string())?;
@@ -736,7 +847,17 @@ fn plugin_command(
             let deployment_url = deployment_url
                 .map(Ok)
                 .unwrap_or_else(|| plugin_dev::deploy_plugin_site(&path))?;
-            let response = MahayanaProductClient::default()
+            let client = MahayanaProductClient::default();
+            client
+                .wait_for_marketplace_deployment(
+                    &plugin_id,
+                    &version,
+                    &deployment_url,
+                    &package_sha256,
+                    package_size,
+                )
+                .map_err(|error| error.to_string())?;
+            let response = client
                 .publish_plugin(
                     &plugin_id,
                     &version,
@@ -744,6 +865,7 @@ fn plugin_command(
                     &package_sha256,
                     package_size,
                     &platforms,
+                    &archive,
                 )
                 .map_err(|error| error.to_string())?;
             print_json(&response)
@@ -1008,6 +1130,11 @@ impl RuntimeHandle {
     fn create(codex_executable_path: Option<&Path>) -> Result<Self, String> {
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
         let bundled_plugin_marketplace = find_bundled_plugin_marketplace(&cwd);
+        let mini_apps = bundled_plugin_marketplace
+            .as_deref()
+            .map(plugin_dev::marketplace_mini_apps)
+            .transpose()?
+            .unwrap_or_default();
         let use_codex_account = std::env::var("MAHAYANA_USE_CODEX_ACCOUNT").as_deref() == Ok("1");
         let mut config = json!({
             "codexExecutablePath": codex_executable_path,
@@ -1015,6 +1142,7 @@ impl RuntimeHandle {
             "cwd": cwd,
             "workspaceRoots": [cwd],
             "bundledPluginMarketplace": bundled_plugin_marketplace,
+            "miniApps": mini_apps,
             "useCodexAccount": use_codex_account,
         });
         if use_codex_account && let Some(codex_home) = std::env::var_os("MAHAYANA_CODEX_HOME") {
