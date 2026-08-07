@@ -128,12 +128,34 @@ fn plugin_site_distribution_is_served_by_the_generated_worker() {
     let wrangler = fs::read_to_string(plugin_root.join("wrangler.toml")).expect("read wrangler");
     assert!(wrangler.contains(".mahayana-distribution"));
 
+    let source = json!({
+        "provider": "github",
+        "repository": "bhrumom/fabushi",
+        "repositoryId": 1037709914_u64,
+        "defaultBranch": "main",
+        "commit": "b".repeat(40),
+        "treeHash": "c".repeat(40),
+        "license": "Apache-2.0",
+        "visibility": "public",
+        "subdirectory": "examples/site-plugin",
+    });
+    let release_manifest = multi_artifact_release_manifest(
+        "site-plugin",
+        "1.2.3",
+        &"a".repeat(64),
+        4,
+        &source,
+        &["cli".to_string(), "desktop".to_string()],
+    )
+    .expect("create release manifest");
     let distribution = prepare_site_distribution(
         &plugin_root,
         "site-plugin",
         "1.2.3",
         &"a".repeat(64),
         &[0x1f, 0x8b, 0x08, 0x00],
+        &source,
+        &release_manifest,
     )
     .expect("prepare distribution");
     assert!(distribution.join("index.html").is_file());
@@ -142,8 +164,20 @@ fn plugin_site_distribution_is_served_by_the_generated_worker() {
         &fs::read_to_string(distribution.join("mahayana/plugin.json")).expect("read site manifest"),
     )
     .expect("parse site manifest");
+    assert_eq!(manifest["schemaVersion"], 2);
     assert_eq!(manifest["pluginId"], "site-plugin");
     assert_eq!(manifest["runtime"], "independent-worker-or-pages");
+    assert_eq!(manifest["source"], source);
+    assert_eq!(
+        manifest["releaseManifestPath"],
+        "/mahayana/release-manifest.json"
+    );
+    assert!(distribution.join("mahayana/source.json").is_file());
+    assert!(
+        distribution
+            .join("mahayana/release-manifest.json")
+            .is_file()
+    );
 
     fs::remove_dir_all(repository).expect("remove test repository");
 }

@@ -837,12 +837,23 @@ fn plugin_command(
             let package_size = archive.len() as u64;
             let package_sha256 = format!("{:x}", Sha256::digest(&archive));
             let platforms = plugin_dev::supported_marketplace_platforms(&path)?;
+            let source = plugin_dev::github_source_identity(&path)?;
+            let release_manifest = plugin_dev::multi_artifact_release_manifest(
+                &plugin_id,
+                &version,
+                &package_sha256,
+                archive.len(),
+                &source,
+                &platforms,
+            )?;
             plugin_dev::prepare_site_distribution(
                 &path,
                 &plugin_id,
                 &version,
                 &package_sha256,
                 &archive,
+                &source,
+                &release_manifest,
             )?;
             let deployment_url = deployment_url
                 .map(Ok)
@@ -855,6 +866,8 @@ fn plugin_command(
                     &deployment_url,
                     &package_sha256,
                     package_size,
+                    &source,
+                    &release_manifest,
                 )
                 .map_err(|error| error.to_string())?;
             let response = client
@@ -866,6 +879,8 @@ fn plugin_command(
                     package_size,
                     &platforms,
                     &archive,
+                    &source,
+                    &release_manifest,
                 )
                 .map_err(|error| error.to_string())?;
             print_json(&response)

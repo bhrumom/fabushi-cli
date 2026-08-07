@@ -9,6 +9,9 @@ use mahayana_platform_core::HostPlatform;
 use mahayana_plugin_host::LocalPlugin;
 use serde_json::Value;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
+use std::env;
 use std::fs;
 use std::path::Component;
 use std::path::Path;
@@ -18,6 +21,167 @@ use std::process::Command;
 pub use super::plugin_dev_template::PluginTemplate;
 
 const SITE_DISTRIBUTION_DIR: &str = ".mahayana-distribution";
+
+fn git_output(plugin_path: &Path, arguments: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(plugin_path)
+        .output()
+        .map_err(|error| format!("failed to run git {}: {error}", arguments.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return Err(format!(
+            "git {} returned an empty value",
+            arguments.join(" ")
+        ));
+    }
+    Ok(value)
+}
+
+fn is_git_object_id(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn source_string<'a>(source: &'a Value, key: &str) -> Result<&'a str, String> {
+    source
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!(".mahayana/source.json requires {key}"))
+}
+
+pub fn github_source_identity(plugin_path: &Path) -> Result<Value, String> {
+    let source_path = plugin_path.join(".mahayana/source.json");
+    let configured: Value = serde_json::from_str(
+        &fs::read_to_string(&source_path)
+            .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?,
+    )
+    .map_err(|error| format!("invalid {}: {error}", source_path.display()))?;
+    if configured.get("provider").and_then(Value::as_str) != Some("github") {
+        return Err(".mahayana/source.json provider must be github".into());
+    }
+    let repository = env::var("GITHUB_REPOSITORY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            source_string(&configured, "repository")
+                .unwrap_or_default()
+                .to_string()
+        });
+    let repository_parts = repository.split('/').collect::<Vec<_>>();
+    if repository_parts.len() != 2
+        || repository_parts.iter().any(|part| part.is_empty())
+        || repository.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+        })
+    {
+        return Err("source repository must be a normalized GitHub owner/name".into());
+    }
+    let repository_id = env::var("GITHUB_REPOSITORY_ID")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| configured.get("repositoryId").and_then(Value::as_u64))
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ".mahayana/source.json requires a positive repositoryId".to_string())?;
+    let default_branch = source_string(&configured, "defaultBranch")?;
+    let license = source_string(&configured, "license")?;
+    if license
+        .bytes()
+        .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-')))
+    {
+        return Err("source license must be an SPDX identifier".into());
+    }
+    let subdirectory = source_string(&configured, "subdirectory")?;
+    let subdirectory_path = Path::new(subdirectory);
+    if subdirectory_path.is_absolute()
+        || subdirectory_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(
+            "source subdirectory must be a repository-relative path without traversal".into(),
+        );
+    }
+    let commit = match env::var("GITHUB_SHA") {
+        Ok(value) if is_git_object_id(&value) => value,
+        _ => git_output(plugin_path, &["rev-parse", "HEAD"])?,
+    };
+    if !is_git_object_id(&commit) {
+        return Err("source commit must be a 40-character Git object ID".into());
+    }
+    let tree_hash = git_output(plugin_path, &["rev-parse", &format!("{commit}^{{tree}}")])?;
+    if !is_git_object_id(&tree_hash) {
+        return Err("source treeHash must be a 40-character Git object ID".into());
+    }
+    Ok(json!({
+        "provider": "github",
+        "repository": repository,
+        "repositoryId": repository_id,
+        "defaultBranch": default_branch,
+        "commit": commit.to_ascii_lowercase(),
+        "treeHash": tree_hash.to_ascii_lowercase(),
+        "license": license,
+        "visibility": "public",
+        "subdirectory": subdirectory,
+    }))
+}
+
+pub fn multi_artifact_release_manifest(
+    plugin_id: &str,
+    version: &str,
+    package_sha256: &str,
+    package_size: usize,
+    source: &Value,
+    platforms: &[String],
+) -> Result<Value, String> {
+    let source_commit = source_string(source, "commit")?;
+    let source_tree_hash = source_string(source, "treeHash")?;
+    if !is_git_object_id(source_commit) || !is_git_object_id(source_tree_hash) {
+        return Err("release source commit and treeHash must be Git object IDs".into());
+    }
+    if package_sha256.len() != 64
+        || !package_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || package_size == 0
+    {
+        return Err("release package digest or size is invalid".into());
+    }
+    let artifact = json!({
+        "id": "host-package",
+        "runtime": "desktop-stdio",
+        "platforms": platforms,
+        "packagePath": "/mahayana/plugin.tar.gz",
+        "sha256": package_sha256.to_ascii_lowercase(),
+        "size": package_size,
+        "sourceCommit": source_commit,
+        "sourceTreeHash": source_tree_hash,
+    });
+    Ok(json!({
+        "schemaVersion": 1,
+        "protocol": "mahayana.multi-artifact-release.v1",
+        "pluginId": plugin_id,
+        "version": version,
+        "source": source,
+        "common": {
+            "id": "common",
+            "packagePath": "/mahayana/plugin.tar.gz",
+            "sha256": package_sha256.to_ascii_lowercase(),
+            "size": package_size,
+            "sourceCommit": source_commit,
+            "sourceTreeHash": source_tree_hash,
+        },
+        "artifacts": [artifact],
+    }))
+}
 
 pub fn supported_marketplace_platforms(plugin_path: &Path) -> Result<Vec<String>, String> {
     let plugin = LocalPlugin::load(plugin_path).map_err(|error| error.to_string())?;
@@ -127,6 +291,8 @@ pub fn prepare_site_distribution(
     version: &str,
     package_sha256: &str,
     archive: &[u8],
+    source: &Value,
+    release_manifest: &Value,
 ) -> Result<PathBuf, String> {
     let wrangler = fs::read_to_string(plugin_path.join("wrangler.toml"))
         .map_err(|_| "插件必须包含 wrangler.toml 才能作为独立 Worker/Pages 发布".to_string())?;
@@ -146,14 +312,30 @@ pub fn prepare_site_distribution(
     let mahayana = distribution.join("mahayana");
     fs::create_dir_all(&mahayana).map_err(|error| error.to_string())?;
     fs::write(mahayana.join("plugin.tar.gz"), archive).map_err(|error| error.to_string())?;
+    let release_manifest_bytes =
+        serde_json::to_vec(release_manifest).map_err(|error| error.to_string())?;
+    let release_manifest_sha256 = format!("{:x}", Sha256::digest(&release_manifest_bytes));
+    fs::write(
+        mahayana.join("release-manifest.json"),
+        &release_manifest_bytes,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(
+        mahayana.join("source.json"),
+        serde_json::to_vec(source).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     let manifest = json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "pluginId": plugin_id,
         "version": version,
         "packagePath": "/mahayana/plugin.tar.gz",
         "packageSha256": package_sha256,
         "packageSize": archive.len(),
         "runtime": "independent-worker-or-pages",
+        "source": source,
+        "releaseManifestPath": "/mahayana/release-manifest.json",
+        "releaseManifestSha256": release_manifest_sha256,
     });
     fs::write(
         mahayana.join("plugin.json"),
