@@ -6,6 +6,7 @@ use mahayana_miniapp_protocol::ContentCompiler;
 use mahayana_miniapp_protocol::ContentSource;
 use mahayana_miniapp_protocol::SourceKind;
 use mahayana_platform_core::HostPlatform;
+use mahayana_platform_core::canonical_json_bytes;
 use mahayana_plugin_host::LocalPlugin;
 use serde_json::Value;
 use serde_json::json;
@@ -313,7 +314,7 @@ pub fn prepare_site_distribution(
     fs::create_dir_all(&mahayana).map_err(|error| error.to_string())?;
     fs::write(mahayana.join("plugin.tar.gz"), archive).map_err(|error| error.to_string())?;
     let release_manifest_bytes =
-        serde_json::to_vec(release_manifest).map_err(|error| error.to_string())?;
+        canonical_json_bytes(release_manifest).map_err(|error| error.to_string())?;
     let release_manifest_sha256 = format!("{:x}", Sha256::digest(&release_manifest_bytes));
     fs::write(
         mahayana.join("release-manifest.json"),

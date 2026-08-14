@@ -4,8 +4,22 @@ use clap::Subcommand;
 use codex_cli::plugin_cmd::PluginCli;
 use codex_cli::plugin_cmd::PluginSubcommand;
 use codex_core_plugins::plugin_bundle_archive::pack_plugin_bundle_tar_gz;
+use mahayana_feature_host::FeatureHostController;
+use mahayana_host::HostCreateConfig;
+use mahayana_host::default_automation_path;
+use mahayana_host::default_product_session_path;
+use mahayana_host::default_product_surface_path;
+use mahayana_host_protocol::AutomationTrigger;
+use mahayana_host_protocol::FeatureCommand;
+use mahayana_host_protocol::HostConfig;
+use mahayana_host_protocol::HostEvent;
+use mahayana_host_protocol::HostMode;
+use mahayana_host_protocol::ListenerPlatform;
+use mahayana_host_protocol::SurfacePlatform;
+use mahayana_platform_core::HostPlatform;
 use mahayana_plugin_host::LocalPlugin;
 use mahayana_product::MahayanaProductClient;
+use mahayana_product::default_mahayana_home;
 use mahayana_product::redact_secrets;
 use mahayana_runtime::mahayana_runtime_close;
 use mahayana_runtime::mahayana_runtime_create;
@@ -85,6 +99,32 @@ enum CliCommand {
     Capability {
         #[command(subcommand)]
         command: CapabilityCommand,
+    },
+    /// 管理 Grok Bot 兼容的连接器账户与工具。
+    Connector {
+        #[command(subcommand)]
+        command: ConnectorCommand,
+    },
+    /// 管理私有和团队 Skill。
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+    /// 管理可见/隐藏机器人。
+    Bot {
+        #[command(subcommand)]
+        command: BotCommand,
+    },
+    /// 管理外部事件监听器。
+    Listener {
+        #[command(subcommand)]
+        command: ListenerCommand,
+    },
+    /// 管理计划或事件驱动的自动化例程。
+    #[command(alias = "automation")]
+    Routine {
+        #[command(subcommand)]
+        command: RoutineCommand,
     },
     /// 查看指定会话的消息历史。
     History { conversation_id: String },
@@ -189,6 +229,126 @@ enum CapabilityCommand {
         capability_id: String,
         #[arg(required = true, trailing_var_arg = true)]
         text: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConnectorCommand {
+    /// 列出真实 Codex MCP 连接状态、账户与工具。
+    List,
+    /// 打开连接器授权流程；本地 Git 直接连接。
+    Connect {
+        connector_id: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// 重命名一个本地账户标签。
+    Rename {
+        connector_id: String,
+        account_id: String,
+        label: String,
+    },
+    /// 移除一个账户；独立 MCP OAuth 会同步删除本地令牌。
+    Remove {
+        connector_id: String,
+        account_id: String,
+    },
+    /// 启用或禁用一个已发现工具。
+    Tool {
+        connector_id: String,
+        tool_id: String,
+        enabled: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    List {
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
+    /// 创建或更新私有 Skill。
+    Upsert {
+        #[arg(long)]
+        id: Option<String>,
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        use_when: String,
+        #[arg(long)]
+        instructions: String,
+        #[arg(long)]
+        owner_agent_id: Option<String>,
+    },
+    Delete {
+        id: String,
+    },
+    Publish {
+        id: String,
+        team_id: String,
+    },
+    Unpublish {
+        id: String,
+    },
+    Sync {
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BotCommand {
+    List,
+    Hide { id: String },
+    Show { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ListenerCommand {
+    List,
+    Connect { platform: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum RoutineCommand {
+    List,
+    Create {
+        name: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value = "@daily")]
+        schedule: String,
+        /// Event source: slack/github/git/teams/linear/sentry/pagerduty.
+        #[arg(long)]
+        source: Option<String>,
+        /// Event name used with --source, for example pull_request.opened.
+        #[arg(long)]
+        event: Option<String>,
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    Run {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    /// Inject a local event into matching event-driven routines. This is the
+    /// CLI/webhook bridge for platforms whose hosted listener service is not
+    /// available in this build.
+    TriggerEvent {
+        source: String,
+        event: String,
+        #[arg(long)]
+        payload: Option<String>,
     },
 }
 
@@ -365,6 +525,12 @@ fn is_product_command(command: &str) -> bool {
             | "history"
             | "send"
             | "chat"
+            | "connector"
+            | "skill"
+            | "bot"
+            | "listener"
+            | "routine"
+            | "automation"
             | "miniapp"
             | "marketplace"
             | "plugin"
@@ -402,6 +568,31 @@ fn run(codex_executable_path: Option<&Path>, cli: Cli) -> Result<(), String> {
         Some(CliCommand::Capability { command }) => {
             with_runtime(codex_executable_path, |runtime| {
                 capability_command(runtime, command)
+            })
+        }
+        Some(CliCommand::Connector { command }) => {
+            feature_surface_command(codex_executable_path, |controller| {
+                connector_command(controller, command)
+            })
+        }
+        Some(CliCommand::Skill { command }) => {
+            feature_surface_command(codex_executable_path, |controller| {
+                skill_command(controller, command)
+            })
+        }
+        Some(CliCommand::Bot { command }) => {
+            feature_surface_command(codex_executable_path, |controller| {
+                bot_command(controller, command)
+            })
+        }
+        Some(CliCommand::Listener { command }) => {
+            feature_surface_command(codex_executable_path, |controller| {
+                listener_command(controller, command)
+            })
+        }
+        Some(CliCommand::Routine { command }) => {
+            feature_surface_command(codex_executable_path, |controller| {
+                routine_command(controller, command)
             })
         }
         Some(CliCommand::History { conversation_id }) => {
@@ -507,6 +698,334 @@ fn capability_command(runtime: &RuntimeHandle, command: CapabilityCommand) -> Re
             "capabilityId": capability_id,
             "text": text.join(" "),
         }))?),
+    }
+}
+
+fn feature_request_id(prefix: &str) -> String {
+    format!("cli-{prefix}-{}", uuid::Uuid::new_v4())
+}
+
+fn parse_listener_platform(value: &str) -> Result<ListenerPlatform, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "slack" => Ok(ListenerPlatform::Slack),
+        "github" | "gh" => Ok(ListenerPlatform::Github),
+        "git" => Ok(ListenerPlatform::Git),
+        "teams" | "microsoft-teams" | "microsoftteams" => Ok(ListenerPlatform::Teams),
+        "linear" => Ok(ListenerPlatform::Linear),
+        "sentry" => Ok(ListenerPlatform::Sentry),
+        "pagerduty" | "pager-duty" => Ok(ListenerPlatform::Pagerduty),
+        other => Err(format!(
+            "不支持的事件来源 {other}；可用值：slack/github/git/teams/linear/sentry/pagerduty"
+        )),
+    }
+}
+
+fn cli_feature_host(codex_executable_path: Option<&Path>) -> Result<FeatureHostController, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut host = HostCreateConfig::default();
+    host.runtime.data_dir = Some(default_mahayana_home().join("runtime"));
+    host.runtime.workspace_roots = vec![cwd.clone()];
+    if let Ok(base_url) = std::env::var("MAHAYANA_RESPONSES_BASE_URL")
+        && !base_url.trim().is_empty()
+    {
+        host.runtime.model.base_url = Some(base_url);
+    }
+    host.product_session_path = Some(default_product_session_path());
+    host.product_surface_state_path = Some(default_product_surface_path());
+    host.automation_path = Some(default_automation_path());
+    host.codex_executable_path = codex_executable_path.map(Path::to_path_buf);
+    host.cwd = Some(cwd);
+    host.host_platform = Some(HostPlatform::Cli);
+    host.inherit_installed_plugins = Some(true);
+    host.use_codex_account = std::env::var("MAHAYANA_USE_CODEX_ACCOUNT").as_deref() == Ok("1");
+    if let Some(codex_home) = std::env::var_os("MAHAYANA_CODEX_HOME") {
+        host.codex_home = Some(PathBuf::from(codex_home));
+    }
+    FeatureHostController::create_with_host_config(
+        HostConfig {
+            profile_id: "cli".into(),
+            mode: HostMode::Production,
+        },
+        SurfacePlatform::Mock,
+        host,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn drain_feature_events(controller: &FeatureHostController) -> Result<Vec<HostEvent>, String> {
+    let mut events = Vec::new();
+    while let Some(event) = controller.receive().map_err(|error| error.to_string())? {
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn feature_surface_command(
+    codex_executable_path: Option<&Path>,
+    operation: impl FnOnce(&FeatureHostController) -> Result<(), String>,
+) -> Result<(), String> {
+    let controller = cli_feature_host(codex_executable_path)?;
+    // Drop host.ready so command output contains only the requested surface.
+    let _ = drain_feature_events(&controller)?;
+    operation(&controller)
+}
+
+fn execute_feature_and_print(
+    controller: &FeatureHostController,
+    command: FeatureCommand,
+) -> Result<(), String> {
+    controller
+        .execute(command)
+        .map_err(|error| error.to_string())?;
+    let events = drain_feature_events(controller)?;
+    print_json(&serde_json::to_value(events).map_err(|error| error.to_string())?)
+}
+
+fn connector_command(
+    controller: &FeatureHostController,
+    command: ConnectorCommand,
+) -> Result<(), String> {
+    let request_id = feature_request_id("connector");
+    let command = match command {
+        ConnectorCommand::List => FeatureCommand::ConnectorList { request_id },
+        ConnectorCommand::Connect {
+            connector_id,
+            label,
+        } => FeatureCommand::ConnectorConnect {
+            request_id,
+            connector_id,
+            account_label: label,
+        },
+        ConnectorCommand::Rename {
+            connector_id,
+            account_id,
+            label,
+        } => FeatureCommand::ConnectorRenameAccount {
+            request_id,
+            connector_id,
+            account_id,
+            label,
+        },
+        ConnectorCommand::Remove {
+            connector_id,
+            account_id,
+        } => FeatureCommand::ConnectorRemoveAccount {
+            request_id,
+            connector_id,
+            account_id,
+        },
+        ConnectorCommand::Tool {
+            connector_id,
+            tool_id,
+            enabled,
+        } => FeatureCommand::ConnectorSetToolEnabled {
+            request_id,
+            connector_id,
+            tool_id,
+            enabled,
+        },
+    };
+    execute_feature_and_print(controller, command)
+}
+
+fn skill_command(controller: &FeatureHostController, command: SkillCommand) -> Result<(), String> {
+    let request_id = feature_request_id("skill");
+    let command = match command {
+        SkillCommand::List { agent_id } => FeatureCommand::SkillList {
+            request_id,
+            agent_id,
+        },
+        SkillCommand::Upsert {
+            id,
+            name,
+            description,
+            use_when,
+            instructions,
+            owner_agent_id,
+        } => FeatureCommand::SkillUpsert {
+            request_id,
+            id,
+            name,
+            description,
+            use_when,
+            instructions,
+            owner_agent_id,
+        },
+        SkillCommand::Delete { id } => FeatureCommand::SkillDelete { request_id, id },
+        SkillCommand::Publish { id, team_id } => FeatureCommand::SkillPublish {
+            request_id,
+            id,
+            team_id,
+        },
+        SkillCommand::Unpublish { id } => FeatureCommand::SkillUnpublish { request_id, id },
+        SkillCommand::Sync { id } => FeatureCommand::SkillSync { request_id, id },
+    };
+    execute_feature_and_print(controller, command)
+}
+
+fn bot_command(controller: &FeatureHostController, command: BotCommand) -> Result<(), String> {
+    let request_id = feature_request_id("bot");
+    let command = match command {
+        BotCommand::List => FeatureCommand::BotList { request_id },
+        BotCommand::Hide { id } => FeatureCommand::BotSetHidden {
+            request_id,
+            id,
+            hidden: true,
+        },
+        BotCommand::Show { id } => FeatureCommand::BotSetHidden {
+            request_id,
+            id,
+            hidden: false,
+        },
+    };
+    execute_feature_and_print(controller, command)
+}
+
+fn listener_command(
+    controller: &FeatureHostController,
+    command: ListenerCommand,
+) -> Result<(), String> {
+    let request_id = feature_request_id("listener");
+    let command = match command {
+        ListenerCommand::List => FeatureCommand::ListenerList { request_id },
+        ListenerCommand::Connect { platform } => FeatureCommand::ListenerConnect {
+            request_id,
+            platform: parse_listener_platform(&platform)?,
+        },
+    };
+    execute_feature_and_print(controller, command)
+}
+
+fn routine_command(
+    controller: &FeatureHostController,
+    command: RoutineCommand,
+) -> Result<(), String> {
+    match command {
+        RoutineCommand::List => execute_feature_and_print(
+            controller,
+            FeatureCommand::AutomationList {
+                request_id: feature_request_id("routine-list"),
+            },
+        ),
+        RoutineCommand::Create {
+            name,
+            prompt,
+            schedule,
+            source,
+            event,
+            filter,
+            disabled,
+        } => {
+            let trigger = match (source, event) {
+                (None, None) => Some(AutomationTrigger::Schedule {
+                    schedule: schedule.clone(),
+                }),
+                (Some(source), Some(event)) => Some(AutomationTrigger::Event {
+                    source: parse_listener_platform(&source)?,
+                    event,
+                    filter,
+                }),
+                _ => {
+                    return Err("事件例程必须同时提供 --source 和 --event".into());
+                }
+            };
+            execute_feature_and_print(
+                controller,
+                FeatureCommand::AutomationUpsert {
+                    request_id: feature_request_id("routine-create"),
+                    id: None,
+                    name,
+                    prompt,
+                    schedule,
+                    trigger,
+                    enabled: !disabled,
+                },
+            )
+        }
+        RoutineCommand::Pause { id } => execute_feature_and_print(
+            controller,
+            FeatureCommand::AutomationSetEnabled {
+                request_id: feature_request_id("routine-pause"),
+                id,
+                enabled: false,
+            },
+        ),
+        RoutineCommand::Resume { id } => execute_feature_and_print(
+            controller,
+            FeatureCommand::AutomationSetEnabled {
+                request_id: feature_request_id("routine-resume"),
+                id,
+                enabled: true,
+            },
+        ),
+        RoutineCommand::Run { id } => execute_feature_and_print(
+            controller,
+            FeatureCommand::AutomationRun {
+                request_id: feature_request_id("routine-run"),
+                id,
+            },
+        ),
+        RoutineCommand::Delete { id } => execute_feature_and_print(
+            controller,
+            FeatureCommand::AutomationDelete {
+                request_id: feature_request_id("routine-delete"),
+                id,
+            },
+        ),
+        RoutineCommand::TriggerEvent {
+            source,
+            event,
+            payload,
+        } => {
+            let source = parse_listener_platform(&source)?;
+            controller
+                .execute(FeatureCommand::AutomationList {
+                    request_id: feature_request_id("routine-event-list"),
+                })
+                .map_err(|error| error.to_string())?;
+            let listed = drain_feature_events(controller)?;
+            let automations = listed
+                .into_iter()
+                .find_map(|event| match event {
+                    HostEvent::AutomationListed { automations, .. } => Some(automations),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let payload = payload.unwrap_or_default();
+            let matching = automations
+                .into_iter()
+                .filter(|automation| automation.enabled)
+                .filter(|automation| match automation.trigger.as_ref() {
+                    Some(AutomationTrigger::Event {
+                        source: trigger_source,
+                        event: trigger_event,
+                        filter,
+                    }) => {
+                        *trigger_source == source
+                            && trigger_event == &event
+                            && filter
+                                .as_ref()
+                                .is_none_or(|filter| payload.contains(filter.as_str()))
+                    }
+                    _ => false,
+                })
+                .map(|automation| automation.id)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                return Err(format!("没有启用的例程匹配事件 {source:?}/{event}"));
+            }
+            let mut events = Vec::new();
+            for id in matching {
+                controller
+                    .execute(FeatureCommand::AutomationRun {
+                        request_id: feature_request_id("routine-event-run"),
+                        id,
+                    })
+                    .map_err(|error| error.to_string())?;
+                events.extend(drain_feature_events(controller)?);
+            }
+            print_json(&serde_json::to_value(events).map_err(|error| error.to_string())?)
+        }
     }
 }
 
@@ -1144,20 +1663,12 @@ struct RuntimeHandle(u64);
 impl RuntimeHandle {
     fn create(codex_executable_path: Option<&Path>) -> Result<Self, String> {
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-        let bundled_plugin_marketplace = find_bundled_plugin_marketplace(&cwd);
-        let mini_apps = bundled_plugin_marketplace
-            .as_deref()
-            .map(plugin_dev::marketplace_mini_apps)
-            .transpose()?
-            .unwrap_or_default();
         let use_codex_account = std::env::var("MAHAYANA_USE_CODEX_ACCOUNT").as_deref() == Ok("1");
         let mut config = json!({
             "codexExecutablePath": codex_executable_path,
             "hostPlatform": "cli",
             "cwd": cwd,
             "workspaceRoots": [cwd],
-            "bundledPluginMarketplace": bundled_plugin_marketplace,
-            "miniApps": mini_apps,
             "useCodexAccount": use_codex_account,
         });
         if use_codex_account && let Some(codex_home) = std::env::var_os("MAHAYANA_CODEX_HOME") {
@@ -1218,28 +1729,6 @@ impl RuntimeHandle {
         let response = unsafe { take_json(mahayana_runtime_interrupt(self.0, request.as_ptr())) }?;
         unwrap_ffi(response).map(|_| ())
     }
-}
-
-fn find_bundled_plugin_marketplace(cwd: &Path) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(path) = std::env::var_os("MAHAYANA_BUNDLED_PLUGIN_MARKETPLACE") {
-        candidates.push(PathBuf::from(path));
-    }
-    candidates.push(cwd.join(".agents/plugins"));
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(bin_dir) = executable.parent()
-    {
-        candidates.push(bin_dir.join("../share/mahayana/plugins"));
-        candidates.push(bin_dir.join("share/mahayana/plugins"));
-        candidates.push(bin_dir.join("../Resources/mahayana/share/mahayana/plugins"));
-    }
-    candidates.into_iter().find_map(|candidate| {
-        candidate
-            .join("marketplace.json")
-            .is_file()
-            .then(|| candidate.canonicalize().ok())
-            .flatten()
-    })
 }
 
 impl Drop for RuntimeHandle {
