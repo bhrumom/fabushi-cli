@@ -8,6 +8,7 @@ use mahayana_miniapp_protocol::SourceKind;
 use mahayana_platform_core::HostPlatform;
 use mahayana_platform_core::canonical_json_bytes;
 use mahayana_plugin_host::LocalPlugin;
+use mahayana_product::default_mahayana_home;
 use serde_json::Value;
 use serde_json::json;
 use sha2::Digest;
@@ -264,10 +265,14 @@ pub fn install_marketplace_bundle(
         }
         let validation = validate_plugin(&staging)?;
         fs::rename(&staging, &destination).map_err(|error| error.to_string())?;
-        update_marketplace(
-            &repository.join(".agents/plugins/marketplace.json"),
-            &plugin_id,
-        )?;
+        let marketplace_path = repository.join(".agents/plugins/marketplace.json");
+        update_marketplace(&marketplace_path, &plugin_id)?;
+        if let Err(error) =
+            sync_installed_marketplace_with_codex(&repository, &marketplace_path, &plugin_id)
+        {
+            let _ = remove_marketplace_entry(&marketplace_path, &plugin_id);
+            return Err(error);
+        }
         Ok(json!({
             "installed": true,
             "pluginId": plugin_id,
@@ -889,6 +894,7 @@ fn validate_marketplace_entry(entry: &Value) -> Result<&str, String> {
         .ok_or_else(|| format!("marketplace plugin {name} requires source.path"))
 }
 
+#[cfg(test)]
 pub fn marketplace_mini_apps(marketplace_root: &Path) -> Result<Vec<Value>, String> {
     let marketplace_path = marketplace_root.join("marketplace.json");
     let marketplace: Value = serde_json::from_str(
@@ -932,6 +938,113 @@ pub fn marketplace_mini_apps(marketplace_root: &Path) -> Result<Vec<Value>, Stri
         }));
     }
     Ok(mini_apps)
+}
+
+fn sync_installed_marketplace_with_codex(
+    repository: &Path,
+    marketplace_path: &Path,
+    plugin_id: &str,
+) -> Result<(), String> {
+    let executable = env::current_exe().map_err(|error| error.to_string())?;
+    let is_mahayana_cli =
+        executable.file_stem().and_then(|value| value.to_str()) == Some("mahayana");
+    if !is_mahayana_cli {
+        return Ok(());
+    }
+
+    let marketplace: Value = serde_json::from_str(
+        &fs::read_to_string(marketplace_path).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("invalid installed marketplace: {error}"))?;
+    let marketplace_name = marketplace
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "installed marketplace name is required".to_string())?;
+    let marketplace_root = marketplace_path
+        .parent()
+        .ok_or_else(|| "installed marketplace root is unavailable".to_string())?;
+
+    run_mahayana_plugin_command(
+        &executable,
+        repository,
+        &[
+            "plugin",
+            "marketplace",
+            "add",
+            marketplace_root
+                .to_str()
+                .ok_or_else(|| "installed marketplace path is not UTF-8".to_string())?,
+            "--json",
+        ],
+    )?;
+    run_mahayana_plugin_command(
+        &executable,
+        repository,
+        &[
+            "plugin",
+            "add",
+            plugin_id,
+            "--marketplace",
+            marketplace_name,
+            "--json",
+        ],
+    )
+}
+
+fn mahayana_runtime_codex_home() -> PathBuf {
+    if env::var("MAHAYANA_USE_CODEX_ACCOUNT").as_deref() == Ok("1")
+        && let Some(codex_home) =
+            env::var_os("MAHAYANA_CODEX_HOME").filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(codex_home);
+    }
+    default_mahayana_home().join("codex")
+}
+
+fn run_mahayana_plugin_command(
+    executable: &Path,
+    repository: &Path,
+    arguments: &[&str],
+) -> Result<(), String> {
+    let codex_home = mahayana_runtime_codex_home();
+    fs::create_dir_all(&codex_home).map_err(|error| {
+        format!(
+            "failed to prepare Mahayana Codex home {}: {error}",
+            codex_home.display()
+        )
+    })?;
+    let output = Command::new(executable)
+        .args(arguments)
+        .current_dir(repository)
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .map_err(|error| format!("failed to run mahayana {}: {error}", arguments.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "mahayana {} failed: {}",
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn remove_marketplace_entry(path: &Path, name: &str) -> Result<(), String> {
+    let mut marketplace = serde_json::from_str::<Value>(
+        &fs::read_to_string(path).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("invalid existing marketplace: {error}"))?;
+    let plugins = marketplace
+        .get_mut("plugins")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "marketplace plugins must be an array".to_string())?;
+    plugins.retain(|plugin| plugin.get("name").and_then(Value::as_str) != Some(name));
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&marketplace).map_err(|error| error.to_string())? + "\n",
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn update_marketplace(path: &Path, name: &str) -> Result<(), String> {

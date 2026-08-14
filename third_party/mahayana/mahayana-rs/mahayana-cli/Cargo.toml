@@ -18,7 +18,7 @@ codex-core-plugins.workspace = true
 codex-tui.workspace = true
 crossterm.workspace = true
 mahayana-core.workspace = true
-mahayana-feature-host.workspace = true
+mahayana-feature-host = { workspace = true, features = ["production"] }
 mahayana-host.workspace = true
 mahayana-host-protocol.workspace = true
 mahayana-ffi = { path = "../mahayana-ffi" }
