@@ -26,6 +26,7 @@ mahayana-product = { package = "mahayana-platform-client", path = "../mahayana-p
 mahayana-miniapp-protocol.workspace = true
 mahayana-platform-core.workspace = true
 mahayana-plugin-host.workspace = true
+mahayana-plugin-runtime.workspace = true
 ratatui.workspace = true
 rpassword.workspace = true
 serde_json.workspace = true

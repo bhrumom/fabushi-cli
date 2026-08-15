@@ -18,6 +18,7 @@ use mahayana_host_protocol::ListenerPlatform;
 use mahayana_host_protocol::SurfacePlatform;
 use mahayana_platform_core::HostPlatform;
 use mahayana_plugin_host::LocalPlugin;
+use mahayana_plugin_runtime::{ArtifactFormat, ArtifactResolver, ExternalReleaseManifest};
 use mahayana_product::MahayanaProductClient;
 use mahayana_product::default_mahayana_home;
 use mahayana_product::redact_secrets;
@@ -454,9 +455,12 @@ enum PluginCommand {
         plugin_id: String,
         #[arg(long)]
         version: String,
-        /// Reuse an already deployed HTTPS plugin site instead of running its deploy script.
-        #[arg(long)]
-        deployment_url: Option<String>,
+        /// External artifact source as JSON. Examples:
+        /// {"type":"github-release","repository":"owner/repo","tag":"v1.0.0","asset":"plugin.tar.gz"}
+        /// {"type":"npm","package":"@scope/plugin","version":"1.0.0"}
+        /// {"type":"https","url":"https://cdn.example/plugin.tar.gz"}
+        #[arg(long, value_name = "JSON")]
+        artifact_source: String,
     },
 }
 
@@ -1033,6 +1037,7 @@ struct VerifiedMarketplaceArchive {
     version: String,
     package_sha256: String,
     package_size: u64,
+    format: ArtifactFormat,
     archive: Vec<u8>,
 }
 
@@ -1070,6 +1075,38 @@ fn verified_marketplace_archive(
     {
         return Err("市场版本元数据与请求的插件或版本不一致".into());
     }
+    if let Some(release_value) = metadata.get("releaseManifest")
+        && release_value.get("protocol").and_then(Value::as_str)
+            == Some("mahayana.external-release.v1")
+    {
+        let release = serde_json::from_value::<ExternalReleaseManifest>(release_value.clone())
+            .map_err(|error| format!("市场 external release manifest 无效：{error}"))?;
+        release.validate().map_err(|error| error.to_string())?;
+        if release.plugin_id != plugin_id || release.version != version {
+            return Err("市场 external release manifest 身份与请求不一致".into());
+        }
+        let artifact = release
+            .select_artifact(
+                "cli",
+                &["native", "desktop-stdio", "deepseek-js", "web-wasm", "mcp"],
+            )
+            .map_err(|error| error.to_string())?;
+        let archive = ArtifactResolver::new()
+            .map_err(|error| error.to_string())?
+            .download_verified(artifact)
+            .map_err(|error| error.to_string())?;
+        return Ok(VerifiedMarketplaceArchive {
+            version,
+            package_sha256: artifact.sha256.to_ascii_lowercase(),
+            package_size: artifact.size,
+            format: artifact.format.clone(),
+            archive,
+        });
+    }
+
+    // Legacy releases keep their historical metadata shape. The legacy
+    // download endpoint is now only a 307 compatibility redirect to the
+    // publisher's external HTTPS artifact; no marketplace bytes are stored.
     let expected_sha256 = metadata
         .get("packageSha256")
         .and_then(Value::as_str)
@@ -1100,6 +1137,7 @@ fn verified_marketplace_archive(
         version,
         package_sha256: actual_sha256,
         package_size: expected_size,
+        format: ArtifactFormat::TarGz,
         archive,
     })
 }
@@ -1125,8 +1163,13 @@ fn marketplace_command(command: MarketplaceCommand) -> Result<(), String> {
             output,
         } => {
             let verified = verified_marketplace_archive(&client, &plugin_id, version.as_deref())?;
+            let extension = match verified.format {
+                ArtifactFormat::TarGz => "tar.gz",
+                ArtifactFormat::Zip => "zip",
+                ArtifactFormat::Directory => "artifact",
+            };
             let output = output.unwrap_or_else(|| {
-                PathBuf::from(format!("{plugin_id}-{}.tar.gz", verified.version))
+                PathBuf::from(format!("{plugin_id}-{}.{extension}", verified.version))
             });
             if let Some(parent) = output
                 .parent()
@@ -1165,6 +1208,9 @@ fn marketplace_command(command: MarketplaceCommand) -> Result<(), String> {
             repository,
         } => {
             let verified = verified_marketplace_archive(&client, &plugin_id, version.as_deref())?;
+            if verified.format != ArtifactFormat::TarGz {
+                return Err("Codex marketplace repository install currently requires a tar.gz CLI artifact".into());
+            }
             print_json(&plugin_dev::install_marketplace_bundle(
                 &repository,
                 &plugin_id,
@@ -1334,7 +1380,7 @@ fn plugin_command(
             path,
             plugin_id,
             version,
-            deployment_url,
+            artifact_source,
         } => {
             let path = plugin_dev::absolute_path(&path)?;
             let plugin = LocalPlugin::load(&path).map_err(|error| error.to_string())?;
@@ -1356,49 +1402,34 @@ fn plugin_command(
             let package_size = archive.len() as u64;
             let package_sha256 = format!("{:x}", Sha256::digest(&archive));
             let platforms = plugin_dev::supported_marketplace_platforms(&path)?;
-            let source = plugin_dev::github_source_identity(&path)?;
-            let release_manifest = plugin_dev::multi_artifact_release_manifest(
-                &plugin_id,
-                &version,
-                &package_sha256,
-                archive.len(),
-                &source,
-                &platforms,
-            )?;
-            plugin_dev::prepare_site_distribution(
-                &path,
-                &plugin_id,
-                &version,
-                &package_sha256,
-                &archive,
-                &source,
-                &release_manifest,
-            )?;
-            let deployment_url = deployment_url
-                .map(Ok)
-                .unwrap_or_else(|| plugin_dev::deploy_plugin_site(&path))?;
+            let source_provenance = plugin_dev::github_source_identity(&path)?;
+            let artifact_source: Value = serde_json::from_str(&artifact_source)
+                .map_err(|error| format!("--artifact-source 必须是合法 JSON: {error}"))?;
+            let release_manifest = json!({
+                "schemaVersion": 1,
+                "protocol": "mahayana.external-release.v1",
+                "pluginId": plugin_id,
+                "version": version,
+                "permissions": [],
+                "artifacts": [{
+                    "id": "plugin-package",
+                    "runtime": "plugin-package",
+                    "platforms": platforms,
+                    "source": artifact_source,
+                    "sha256": package_sha256,
+                    "size": package_size,
+                    "format": "tar-gz"
+                }]
+            });
             let client = MahayanaProductClient::default();
-            client
-                .wait_for_marketplace_deployment(
-                    &plugin_id,
-                    &version,
-                    &deployment_url,
-                    &package_sha256,
-                    package_size,
-                    &source,
-                    &release_manifest,
-                )
-                .map_err(|error| error.to_string())?;
             let response = client
-                .publish_plugin(
+                .publish_external_plugin(
                     &plugin_id,
                     &version,
-                    &deployment_url,
-                    &package_sha256,
-                    package_size,
+                    &plugin.codex.name,
+                    "",
                     &platforms,
-                    &archive,
-                    &source,
+                    &source_provenance,
                     &release_manifest,
                 )
                 .map_err(|error| error.to_string())?;
