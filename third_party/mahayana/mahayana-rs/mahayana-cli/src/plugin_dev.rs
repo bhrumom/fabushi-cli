@@ -6,12 +6,15 @@ use mahayana_miniapp_protocol::ContentCompiler;
 use mahayana_miniapp_protocol::ContentSource;
 use mahayana_miniapp_protocol::SourceKind;
 use mahayana_platform_core::HostPlatform;
+#[cfg(test)]
 use mahayana_platform_core::canonical_json_bytes;
 use mahayana_plugin_host::LocalPlugin;
 use mahayana_product::default_mahayana_home;
 use serde_json::Value;
 use serde_json::json;
+#[cfg(test)]
 use sha2::Digest;
+#[cfg(test)]
 use sha2::Sha256;
 use std::env;
 use std::fs;
@@ -22,6 +25,7 @@ use std::process::Command;
 
 pub use super::plugin_dev_template::PluginTemplate;
 
+#[cfg(test)]
 const SITE_DISTRIBUTION_DIR: &str = ".mahayana-distribution";
 
 fn git_output(plugin_path: &Path, arguments: &[&str]) -> Result<String, String> {
@@ -138,6 +142,7 @@ pub fn github_source_identity(plugin_path: &Path) -> Result<Value, String> {
     }))
 }
 
+#[cfg(test)]
 pub fn multi_artifact_release_manifest(
     plugin_id: &str,
     version: &str,
@@ -291,6 +296,7 @@ pub fn install_marketplace_bundle(
     result
 }
 
+#[cfg(test)]
 pub fn prepare_site_distribution(
     plugin_path: &Path,
     plugin_id: &str,
@@ -357,37 +363,7 @@ pub fn prepare_site_distribution(
     Ok(distribution)
 }
 
-pub fn deploy_plugin_site(plugin_path: &Path) -> Result<String, String> {
-    let package: Value = serde_json::from_str(
-        &fs::read_to_string(plugin_path.join("package.json")).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    if package
-        .pointer("/scripts/deploy")
-        .and_then(Value::as_str)
-        .is_none()
-    {
-        return Err("插件 package.json 必须声明 deploy 脚本".into());
-    }
-    let output = Command::new("npm")
-        .args(["run", "deploy"])
-        .current_dir(plugin_path)
-        .output()
-        .map_err(|error| format!("failed to start plugin deployment: {error}"))?;
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() {
-        return Err(format!("插件 Worker/Pages 部署失败：{}", combined.trim()));
-    }
-    deployment_url_from_output(&combined).ok_or_else(|| {
-        "部署成功但未返回可验证的 workers.dev/pages.dev HTTPS 地址；请用 --deployment-url 指定"
-            .to_string()
-    })
-}
-
+#[cfg(test)]
 fn deployment_url_from_output(output: &str) -> Option<String> {
     output.split_whitespace().find_map(|word| {
         let candidate = word.trim_matches(|character: char| {
@@ -409,6 +385,7 @@ fn deployment_url_from_output(output: &str) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn copy_site_tree(source: &Path, destination: &Path) -> Result<(), String> {
     fs::create_dir_all(destination).map_err(|error| error.to_string())?;
     for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
@@ -429,6 +406,7 @@ fn copy_site_tree(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")

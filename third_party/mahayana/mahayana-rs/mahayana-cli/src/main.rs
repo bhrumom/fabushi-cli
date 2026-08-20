@@ -101,7 +101,7 @@ enum CliCommand {
         #[command(subcommand)]
         command: CapabilityCommand,
     },
-    /// 管理 Grok Bot 兼容的连接器账户与工具。
+    /// 管理 Fabushi 连接器账户与工具。
     Connector {
         #[command(subcommand)]
         command: ConnectorCommand,
@@ -909,6 +909,7 @@ fn routine_command(
             controller,
             FeatureCommand::AutomationList {
                 request_id: feature_request_id("routine-list"),
+                agent_id: None,
             },
         ),
         RoutineCommand::Create {
@@ -938,6 +939,7 @@ fn routine_command(
                 FeatureCommand::AutomationUpsert {
                     request_id: feature_request_id("routine-create"),
                     id: None,
+                    agent_id: None,
                     name,
                     prompt,
                     schedule,
@@ -952,6 +954,7 @@ fn routine_command(
                 request_id: feature_request_id("routine-pause"),
                 id,
                 enabled: false,
+                agent_id: None,
             },
         ),
         RoutineCommand::Resume { id } => execute_feature_and_print(
@@ -960,6 +963,7 @@ fn routine_command(
                 request_id: feature_request_id("routine-resume"),
                 id,
                 enabled: true,
+                agent_id: None,
             },
         ),
         RoutineCommand::Run { id } => execute_feature_and_print(
@@ -967,6 +971,7 @@ fn routine_command(
             FeatureCommand::AutomationRun {
                 request_id: feature_request_id("routine-run"),
                 id,
+                agent_id: None,
             },
         ),
         RoutineCommand::Delete { id } => execute_feature_and_print(
@@ -974,6 +979,7 @@ fn routine_command(
             FeatureCommand::AutomationDelete {
                 request_id: feature_request_id("routine-delete"),
                 id,
+                agent_id: None,
             },
         ),
         RoutineCommand::TriggerEvent {
@@ -985,6 +991,7 @@ fn routine_command(
             controller
                 .execute(FeatureCommand::AutomationList {
                     request_id: feature_request_id("routine-event-list"),
+                    agent_id: None,
                 })
                 .map_err(|error| error.to_string())?;
             let listed = drain_feature_events(controller)?;
@@ -1024,6 +1031,7 @@ fn routine_command(
                     .execute(FeatureCommand::AutomationRun {
                         request_id: feature_request_id("routine-event-run"),
                         id,
+                        agent_id: None,
                     })
                     .map_err(|error| error.to_string())?;
                 events.extend(drain_feature_events(controller)?);
@@ -1209,7 +1217,10 @@ fn marketplace_command(command: MarketplaceCommand) -> Result<(), String> {
         } => {
             let verified = verified_marketplace_archive(&client, &plugin_id, version.as_deref())?;
             if verified.format != ArtifactFormat::TarGz {
-                return Err("Codex marketplace repository install currently requires a tar.gz CLI artifact".into());
+                return Err(
+                    "Codex marketplace repository install currently requires a tar.gz CLI artifact"
+                        .into(),
+                );
             }
             print_json(&plugin_dev::install_marketplace_bundle(
                 &repository,
