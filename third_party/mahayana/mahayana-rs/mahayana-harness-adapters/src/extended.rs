@@ -4,8 +4,9 @@ use mahayana_harness::{
     ToolInterceptor,
 };
 use mahayana_harness_services::{
-    AcpProvider, CompactionProvider, CredentialProvider, CredentialReference, SubagentProvider,
-    TerminalProvider, WorkflowExecutor,
+    AcpProvider, AcpRequest, CompactionProvider, CompactionRequest, CredentialProvider,
+    CredentialReference, SubagentProvider, SubagentRequest, TerminalProvider, TerminalRequest,
+    WorkflowExecutor, WorkflowRequest,
 };
 use mahayana_tool_host::{ToolCapabilities, ToolError, ToolHost, ToolRequest, ToolResult};
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{ToolHostAdapters, value_to_bytes};
+use crate::ToolHostAdapters;
 
 const TERMINAL_OPEN: &str = "terminal.open";
 const TERMINAL_WRITE: &str = "terminal.write";
@@ -26,154 +27,119 @@ const CREDENTIAL_RESOLVE: &str = "credential.resolve";
 const CREDENTIAL_REMOVE: &str = "credential.remove";
 const COMPACTION_RUN: &str = "compaction.run";
 const SUBAGENT_SPAWN: &str = "subagent.spawn";
-const SUBAGENT_RESUME: &str = "subagent.resume";
-const SUBAGENT_STOP: &str = "subagent.stop";
 const WORKFLOW_RUN: &str = "workflow.run";
 const ACP_HANDLE: &str = "acp.handle";
 
 #[async_trait]
 impl TerminalProvider for ToolHostAdapters {
-    async fn open(&self, cwd: Option<&str>) -> HarnessResult<String> {
-        let value = self
-            .invoke_value(TERMINAL_OPEN, json!({"cwd": cwd}))
-            .await?;
-        value
-            .get("terminalId")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("id").and_then(Value::as_str))
-            .or_else(|| value.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| HarnessError::ToolExecution("terminal.open returned no id".into()))
-    }
-
-    async fn write(&self, terminal_id: &str, data: &[u8]) -> HarnessResult<()> {
+    async fn perform(&self, request: TerminalRequest) -> HarnessResult<Value> {
+        let route = match request.operation.as_str() {
+            "open" => TERMINAL_OPEN,
+            "write" => TERMINAL_WRITE,
+            "read" => TERMINAL_READ,
+            "close" => TERMINAL_CLOSE,
+            operation => {
+                return Err(HarnessError::InvalidConfig(format!(
+                    "unsupported terminal operation: {operation}"
+                )));
+            }
+        };
         self.invoke_value(
-            TERMINAL_WRITE,
-            json!({"terminalId": terminal_id, "bytes": data}),
+            route,
+            json!({
+                "operation": request.operation,
+                "terminalId": request.terminal_id,
+                "data": request.data,
+                "cwd": request.cwd,
+            }),
         )
-        .await?;
-        Ok(())
-    }
-
-    async fn read(&self, terminal_id: &str) -> HarnessResult<Vec<u8>> {
-        let value = self
-            .invoke_value(TERMINAL_READ, json!({"terminalId": terminal_id}))
-            .await?;
-        if let Some(content) = value.get("content") {
-            return value_to_bytes(content.clone());
-        }
-        value_to_bytes(value)
-    }
-
-    async fn close(&self, terminal_id: &str) -> HarnessResult<()> {
-        self.invoke_value(TERMINAL_CLOSE, json!({"terminalId": terminal_id}))
-            .await?;
-        Ok(())
+        .await
     }
 }
 
 #[async_trait]
 impl CredentialProvider for ToolHostAdapters {
-    fn id(&self) -> &str {
-        "mahayana-tool-host"
+    async fn store(&self, reference: &CredentialReference, secret: &str) -> HarnessResult<()> {
+        self.invoke_value(
+            CREDENTIAL_STORE,
+            json!({
+                "id": reference.id,
+                "service": reference.service,
+                "account": reference.account,
+                "secret": secret,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
-    async fn store(&self, label: &str, secret: &[u8]) -> HarnessResult<CredentialReference> {
+    async fn resolve(&self, reference: &CredentialReference) -> HarnessResult<Option<String>> {
         let value = self
             .invoke_value(
-                CREDENTIAL_STORE,
-                json!({"label": label, "secretBytes": secret}),
+                CREDENTIAL_RESOLVE,
+                json!({"id": reference.id, "service": reference.service, "account": reference.account}),
             )
             .await?;
-        let id = value
-            .get("id")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("referenceId").and_then(Value::as_str))
-            .or_else(|| value.as_str())
-            .ok_or_else(|| {
-                HarnessError::ToolExecution("credential.store returned no reference id".into())
-            })?;
-        Ok(CredentialReference {
-            id: id.to_string(),
-            provider: self.id().to_string(),
-            label: label.to_string(),
-        })
-    }
-
-    async fn resolve(&self, reference: &CredentialReference) -> HarnessResult<Vec<u8>> {
-        let value = self
-            .invoke_value(CREDENTIAL_RESOLVE, json!({"id": reference.id}))
-            .await?;
-        if let Some(secret) = value.get("secretBytes") {
-            return value_to_bytes(secret.clone());
+        if value.is_null() {
+            return Ok(None);
         }
-        value_to_bytes(value)
+        if let Some(secret) = value.get("secret").and_then(Value::as_str) {
+            return Ok(Some(secret.to_string()));
+        }
+        Ok(value.as_str().map(str::to_string))
     }
 
     async fn remove(&self, reference: &CredentialReference) -> HarnessResult<()> {
-        self.invoke_value(CREDENTIAL_REMOVE, json!({"id": reference.id}))
-            .await?;
+        self.invoke_value(
+            CREDENTIAL_REMOVE,
+            json!({"id": reference.id, "service": reference.service, "account": reference.account}),
+        )
+        .await?;
         Ok(())
     }
 }
 
 #[async_trait]
 impl CompactionProvider for ToolHostAdapters {
-    async fn compact(&self, session_id: &str, transcript: &str) -> HarnessResult<String> {
-        let value = self
-            .invoke_value(
-                COMPACTION_RUN,
-                json!({"sessionId": session_id, "transcript": transcript}),
-            )
-            .await?;
-        value
-            .get("summary")
-            .and_then(Value::as_str)
-            .or_else(|| value.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| HarnessError::ToolExecution("compaction.run returned no summary".into()))
+    async fn compact(&self, request: CompactionRequest) -> HarnessResult<Value> {
+        self.invoke_value(
+            COMPACTION_RUN,
+            json!({
+                "sessionId": request.session_id,
+                "events": request.events,
+                "targetTokens": request.target_tokens,
+            }),
+        )
+        .await
     }
 }
 
 #[async_trait]
 impl SubagentProvider for ToolHostAdapters {
-    async fn spawn(&self, preset: &str, instruction: &str) -> HarnessResult<String> {
-        let value = self
-            .invoke_value(
-                SUBAGENT_SPAWN,
-                json!({"preset": preset, "instruction": instruction}),
-            )
-            .await?;
-        value
-            .get("agentId")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("id").and_then(Value::as_str))
-            .or_else(|| value.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| HarnessError::ToolExecution("subagent.spawn returned no id".into()))
-    }
-
-    async fn resume(&self, subagent_id: &str, instruction: &str) -> HarnessResult<Value> {
+    async fn spawn(&self, request: SubagentRequest) -> HarnessResult<Value> {
         self.invoke_value(
-            SUBAGENT_RESUME,
-            json!({"agentId": subagent_id, "instruction": instruction}),
+            SUBAGENT_SPAWN,
+            json!({
+                "parentSessionId": request.parent_session_id,
+                "role": request.role,
+                "instruction": request.instruction,
+                "context": request.context,
+            }),
         )
         .await
-    }
-
-    async fn stop(&self, subagent_id: &str) -> HarnessResult<()> {
-        self.invoke_value(SUBAGENT_STOP, json!({"agentId": subagent_id}))
-            .await?;
-        Ok(())
     }
 }
 
 #[async_trait]
 impl WorkflowExecutor for ToolHostAdapters {
-    async fn run(&self, workflow_id: &str, input: Value) -> HarnessResult<Value> {
+    async fn execute(&self, request: WorkflowRequest) -> HarnessResult<Value> {
         self.invoke_value(
             WORKFLOW_RUN,
-            json!({"workflowId": workflow_id, "input": input}),
+            json!({
+                "workflowId": request.workflow_id,
+                "sessionId": request.session_id,
+                "input": request.input,
+            }),
         )
         .await
     }
@@ -181,9 +147,12 @@ impl WorkflowExecutor for ToolHostAdapters {
 
 #[async_trait]
 impl AcpProvider for ToolHostAdapters {
-    async fn handle(&self, method: &str, params: Value) -> HarnessResult<Value> {
-        self.invoke_value(ACP_HANDLE, json!({"method": method, "params": params}))
-            .await
+    async fn call(&self, request: AcpRequest) -> HarnessResult<Value> {
+        self.invoke_value(
+            ACP_HANDLE,
+            json!({"operation": request.operation, "payload": request.payload}),
+        )
+        .await
     }
 }
 

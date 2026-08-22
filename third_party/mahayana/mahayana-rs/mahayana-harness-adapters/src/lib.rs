@@ -7,8 +7,9 @@ pub use extended::*;
 use async_trait::async_trait;
 use mahayana_harness::{HarnessError, HarnessResult};
 use mahayana_harness_services::{
-    CodeRuntimeProvider, CommandProvider, ContentStore, FileSystemProvider, LspProvider,
-    ShellProvider, WebProvider,
+    CodeRuntimeProvider, CodeRuntimeRequest, CommandProvider, ContentStore, FileSystemProvider,
+    FileSystemRequest, LspProvider, LspRequest, ShellProvider, ShellRequest, WebProvider,
+    WebRequest,
 };
 use mahayana_tool_host::{ToolHost, ToolRequest, ToolResult};
 use serde_json::{Value, json};
@@ -91,13 +92,10 @@ impl ToolHostAdapters {
 
 #[async_trait]
 impl ShellProvider for ToolHostAdapters {
-    async fn execute(&self, command: &str, cwd: Option<&str>) -> HarnessResult<ToolResult> {
+    async fn run(&self, request: ShellRequest) -> HarnessResult<ToolResult> {
         self.invoke(
             &self.routes.shell,
-            json!({
-                "command": command,
-                "cwd": cwd,
-            }),
+            json!({"command": request.command, "cwd": request.cwd, "env": request.env}),
         )
         .await
     }
@@ -105,56 +103,42 @@ impl ShellProvider for ToolHostAdapters {
 
 #[async_trait]
 impl FileSystemProvider for ToolHostAdapters {
-    async fn read(&self, path: &str) -> HarnessResult<Vec<u8>> {
-        let value = self
-            .invoke_value(&self.routes.fs_read, json!({"path": path}))
-            .await?;
-        value_to_bytes(value)
-    }
-
-    async fn write(&self, path: &str, bytes: &[u8]) -> HarnessResult<()> {
+    async fn perform(&self, request: FileSystemRequest) -> HarnessResult<Value> {
+        let route = match request.operation.as_str() {
+            "read" => &self.routes.fs_read,
+            "write" => &self.routes.fs_write,
+            "list" => &self.routes.fs_list,
+            "remove" | "delete" => &self.routes.fs_remove,
+            operation => {
+                return Err(HarnessError::InvalidConfig(format!(
+                    "unsupported filesystem operation: {operation}"
+                )));
+            }
+        };
         self.invoke_value(
-            &self.routes.fs_write,
+            route,
             json!({
-                "path": path,
-                "bytes": bytes,
-                "encoding": "bytes",
+                "operation": request.operation,
+                "path": request.path,
+                "destination": request.destination,
+                "content": request.content,
             }),
         )
-        .await?;
-        Ok(())
-    }
-
-    async fn list(&self, path: &str) -> HarnessResult<Vec<String>> {
-        let value = self
-            .invoke_value(&self.routes.fs_list, json!({"path": path}))
-            .await?;
-        let array = value.as_array().ok_or_else(|| {
-            HarnessError::ToolExecution("filesystem list result is not an array".into())
-        })?;
-        Ok(array
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect())
-    }
-
-    async fn remove(&self, path: &str) -> HarnessResult<()> {
-        self.invoke_value(&self.routes.fs_remove, json!({"path": path}))
-            .await?;
-        Ok(())
+        .await
     }
 }
 
 #[async_trait]
 impl LspProvider for ToolHostAdapters {
-    async fn request(&self, language: &str, method: &str, params: Value) -> HarnessResult<Value> {
+    async fn perform(&self, request: LspRequest) -> HarnessResult<Value> {
         self.invoke_value(
             &self.routes.lsp,
             json!({
-                "language": language,
-                "method": method,
-                "params": params,
+                "operation": request.operation,
+                "language": request.language,
+                "path": request.path,
+                "position": request.position,
+                "query": request.query,
             }),
         )
         .await
@@ -163,26 +147,38 @@ impl LspProvider for ToolHostAdapters {
 
 #[async_trait]
 impl WebProvider for ToolHostAdapters {
-    async fn search(&self, query: &str) -> HarnessResult<Value> {
-        self.invoke_value(&self.routes.web_search, json!({"query": query}))
-            .await
-    }
-
-    async fn fetch(&self, url: &str) -> HarnessResult<Value> {
-        self.invoke_value(&self.routes.web_fetch, json!({"url": url}))
-            .await
+    async fn perform(&self, request: WebRequest) -> HarnessResult<Value> {
+        let route = match request.operation.as_str() {
+            "search" => &self.routes.web_search,
+            "fetch" | "open" => &self.routes.web_fetch,
+            operation => {
+                return Err(HarnessError::InvalidConfig(format!(
+                    "unsupported web operation: {operation}"
+                )));
+            }
+        };
+        self.invoke_value(
+            route,
+            json!({
+                "operation": request.operation,
+                "query": request.query,
+                "url": request.url,
+                "options": request.options,
+            }),
+        )
+        .await
     }
 }
 
 #[async_trait]
 impl CodeRuntimeProvider for ToolHostAdapters {
-    async fn execute(&self, language: &str, source: &str, input: Value) -> HarnessResult<Value> {
+    async fn run(&self, request: CodeRuntimeRequest) -> HarnessResult<Value> {
         self.invoke_value(
             &self.routes.code_execute,
             json!({
-                "language": language,
-                "source": source,
-                "input": input,
+                "language": request.language,
+                "code": request.code,
+                "cwd": request.cwd,
             }),
         )
         .await
@@ -191,13 +187,10 @@ impl CodeRuntimeProvider for ToolHostAdapters {
 
 #[async_trait]
 impl CommandProvider for ToolHostAdapters {
-    async fn execute(&self, command: &str, input: Value) -> HarnessResult<Value> {
+    async fn invoke(&self, name: &str, arguments: Value) -> HarnessResult<Value> {
         self.invoke_value(
             &self.routes.command_execute,
-            json!({
-                "command": command,
-                "input": input,
-            }),
+            json!({"command": name, "arguments": arguments}),
         )
         .await
     }
@@ -304,30 +297,6 @@ fn value_message(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-fn value_to_bytes(value: Value) -> HarnessResult<Vec<u8>> {
-    if let Some(text) = value.as_str() {
-        return Ok(text.as_bytes().to_vec());
-    }
-    if let Some(bytes) = value.as_array() {
-        return bytes
-            .iter()
-            .map(|value| {
-                value
-                    .as_u64()
-                    .and_then(|byte| u8::try_from(byte).ok())
-                    .ok_or_else(|| {
-                        HarnessError::ToolExecution(
-                            "filesystem byte result contains a non-byte value".into(),
-                        )
-                    })
-            })
-            .collect();
-    }
-    Err(HarnessError::ToolExecution(
-        "filesystem read result is neither text nor byte array".into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,9 +325,16 @@ mod tests {
     #[tokio::test]
     async fn shell_routes_through_existing_tool_host() {
         let adapters = ToolHostAdapters::new(Arc::new(EchoToolHost));
-        let result = ShellProvider::execute(&adapters, "pwd", Some("/tmp"))
-            .await
-            .unwrap();
+        let result = ShellProvider::run(
+            &adapters,
+            ShellRequest {
+                command: "pwd".into(),
+                cwd: Some("/tmp".into()),
+                env: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(result.content["name"], "shell");
         assert_eq!(result.content["arguments"]["command"], "pwd");
         assert_eq!(result.content["arguments"]["cwd"], "/tmp");

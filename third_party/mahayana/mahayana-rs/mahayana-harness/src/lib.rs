@@ -51,6 +51,16 @@ pub enum HarnessError {
     InvalidConfig(String),
     #[error("tool execution failed: {0}")]
     ToolExecution(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
+    #[error("serialization failed: {0}")]
+    Serialization(String),
+    #[error("invalid state: {0}")]
+    InvalidState(String),
     #[error("state mutex is poisoned")]
     StatePoisoned,
 }
@@ -280,7 +290,8 @@ struct HarnessState {
     sessions: BTreeMap<String, SessionRecord>,
     agents: BTreeMap<String, AgentDescriptor>,
     approvals: BTreeMap<String, ApprovalRequest>,
-    approved_tools: BTreeSet<String>,
+    approved_once: BTreeSet<(Option<String>, String)>,
+    approved_for_session: BTreeMap<String, BTreeSet<String>>,
     goals: BTreeMap<String, GoalRecord>,
     jobs: BTreeMap<String, JobRecord>,
     workflows: BTreeMap<String, WorkflowRecord>,
@@ -313,7 +324,8 @@ impl HarnessState {
             sessions: BTreeMap::new(),
             agents: BTreeMap::new(),
             approvals: BTreeMap::new(),
-            approved_tools: BTreeSet::new(),
+            approved_once: BTreeSet::new(),
+            approved_for_session: BTreeMap::new(),
             goals: BTreeMap::new(),
             jobs: BTreeMap::new(),
             workflows: BTreeMap::new(),
@@ -331,6 +343,12 @@ pub struct MahayanaHarness {
     state: Arc<Mutex<HarnessState>>,
 }
 
+impl Default for MahayanaHarness {
+    fn default() -> Self {
+        Self::new(BuildProfile::DesktopFull)
+    }
+}
+
 impl MahayanaHarness {
     pub fn new(build_profile: BuildProfile) -> Self {
         let harness = Self {
@@ -344,6 +362,10 @@ impl MahayanaHarness {
             Value::Null,
         );
         harness
+    }
+
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
     }
 
     pub fn register_service(&self, name: impl Into<String>) -> HarnessResult<()> {
@@ -716,13 +738,24 @@ impl MahayanaHarness {
         request: ToolRequest,
     ) -> HarnessResult<ToolResult> {
         let (registered, interceptors, approved) = {
-            let state = self.state()?;
+            let mut state = self.state()?;
             let registered = state
                 .tools
                 .get(&request.name)
                 .cloned()
                 .ok_or_else(|| HarnessError::ToolNotFound(request.name.clone()))?;
-            let approved = state.approved_tools.contains(&request.name);
+            let approved =
+                if registered.definition.requires_approval && !registered.definition.read_only {
+                    let session_approved = session_id
+                        .and_then(|id| state.approved_for_session.get(id))
+                        .is_some_and(|tools| tools.contains(&request.name));
+                    let one_shot_approved = state
+                        .approved_once
+                        .remove(&(session_id.map(ToOwned::to_owned), request.name.clone()));
+                    session_approved || one_shot_approved
+                } else {
+                    true
+                };
             (registered, state.interceptors.clone(), approved)
         };
 
@@ -789,14 +822,30 @@ impl MahayanaHarness {
         let mut state = self.state()?;
         let approval = state
             .approvals
-            .remove(approval_id)
+            .get(approval_id)
+            .cloned()
             .ok_or_else(|| HarnessError::ApprovalNotFound(approval_id.into()))?;
-        if matches!(
-            decision,
-            ApprovalDecision::Accept | ApprovalDecision::AcceptForSession
-        ) {
-            state.approved_tools.insert(approval.tool.clone());
+        match decision {
+            ApprovalDecision::Accept => {
+                state
+                    .approved_once
+                    .insert((approval.session_id.clone(), approval.tool.clone()));
+            }
+            ApprovalDecision::AcceptForSession => {
+                let session_id = approval.session_id.clone().ok_or_else(|| {
+                    HarnessError::InvalidConfig(
+                        "AcceptForSession requires a session-scoped approval".into(),
+                    )
+                })?;
+                state
+                    .approved_for_session
+                    .entry(session_id)
+                    .or_default()
+                    .insert(approval.tool.clone());
+            }
+            ApprovalDecision::Decline | ApprovalDecision::Cancel => {}
         }
+        state.approvals.remove(approval_id);
         drop(state);
         self.emit(EventScope::Capability, "tool/approval-resolved", approval.session_id.as_deref(), None, serde_json::json!({"approvalId": approval_id, "tool": approval.tool, "decision": decision}))?;
         Ok(())
@@ -853,6 +902,10 @@ impl MahayanaHarness {
             .map(|message| format!("{}: {}", message.role, message.content))
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+
+    pub fn sessions(&self) -> HarnessResult<Vec<SessionRecord>> {
+        Ok(self.state()?.sessions.values().cloned().collect())
     }
 
     pub fn snapshot(&self) -> HarnessResult<RuntimeSnapshot> {

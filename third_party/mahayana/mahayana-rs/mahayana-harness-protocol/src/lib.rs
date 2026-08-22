@@ -12,7 +12,6 @@ use mahayana_harness_advanced::{
 };
 use mahayana_harness_services::{
     CommandRecord, ContextFragment, HarnessServices, PromptSection, SkillRecord, TeamMember,
-    WorkspaceRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -64,6 +63,11 @@ impl HarnessApi {
     }
 
     pub fn from_parts(harness: MahayanaHarness, services: HarnessServices) -> HarnessResult<Self> {
+        if !harness.shares_state_with(&services.harness()) {
+            return Err(HarnessError::InvalidConfig(
+                "HarnessApi parts must share one MahayanaHarness runtime".into(),
+            ));
+        }
         Ok(Self {
             advanced: AdvancedHarnessServices::new(harness.clone()),
             harness,
@@ -222,23 +226,24 @@ impl HarnessApi {
 
             "prompt.register" => {
                 self.services
-                    .add_prompt_section(from_payload::<PromptSection>(payload)?)?;
+                    .register_prompt_section(from_payload::<PromptSection>(payload)?)?;
                 Ok(Value::Null)
             }
-            "prompt.assemble" => Ok(json!({"prompt": self.services.assembled_prompt()?})),
+            "prompt.assemble" => Ok(
+                json!({"prompt": self.services.assemble_prompt(optional_str(&payload, "base").unwrap_or(""))?}),
+            ),
             "context.inject" => {
                 self.services
                     .inject_context(from_payload::<ContextFragment>(payload)?)?;
                 Ok(Value::Null)
             }
-            "context.list" => to_value(self.services.assembled_context()?),
+            "context.list" => to_value(self.services.context_fragments()?),
 
-            "workspace.register" => {
-                self.services
-                    .register_workspace(from_payload::<WorkspaceRecord>(payload)?)?;
-                Ok(Value::Null)
-            }
-            "workspace.list" => to_value(self.services.list_workspaces()?),
+            "workspace.register" => to_value(self.services.register_workspace(
+                required_string(&payload, "root")?,
+                required_string(&payload, "label")?,
+            )?),
+            "workspace.list" => to_value(self.services.workspaces()?),
             "settings.set" => to_value(self.services.set_setting(
                 required_string(&payload, "key")?,
                 payload.get("value").cloned().unwrap_or(Value::Null),
@@ -246,10 +251,10 @@ impl HarnessApi {
             "settings.get" => to_value(self.services.get_setting(required_str(&payload, "key")?)?),
 
             "todo.add" => to_value(self.services.add_todo(required_string(&payload, "text")?)?),
-            "todo.update" => to_value(self.services.update_todo(
-                required_str(&payload, "todoId")?,
-                required_string(&payload, "status")?,
-            )?),
+            "todo.update" => to_value(
+                self.services
+                    .update_todo(required_str(&payload, "todoId")?, todo_done(&payload)?)?,
+            ),
             "plan.set" => to_value(
                 self.services.set_plan(
                     required_string(&payload, "sessionId")?,
@@ -269,23 +274,27 @@ impl HarnessApi {
                         .unwrap_or(false),
                 )?,
             ),
-            "agentPlan.enter" => to_value(self.advanced.enter_plan(
-                required_string(&payload, "agentId")?,
-                required_string(&payload, "sessionId")?,
-                string_array(&payload, "steps")?,
-                payload
-                    .get("reviewRequired")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
-            )?),
-            "agentPlan.exit" => to_value(self.advanced.exit_plan(
-                required_str(&payload, "agentId")?,
-                payload
-                    .get("approved")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                optional_string(&payload, "reviewer"),
-            )?),
+            "agentPlan.enter" => to_value(
+                self.advanced.enter_plan(
+                    required_string(&payload, "agentId")?,
+                    required_string(&payload, "sessionId")?,
+                    string_array(&payload, "steps")?,
+                    payload
+                        .get("reviewRequired")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                )?,
+            ),
+            "agentPlan.exit" => to_value(
+                self.advanced.exit_plan(
+                    required_str(&payload, "agentId")?,
+                    payload
+                        .get("approved")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    optional_string(&payload, "reviewer"),
+                )?,
+            ),
             "agentPlan.get" => to_value(
                 self.advanced
                     .agent_plan(required_str(&payload, "agentId")?)?,
@@ -300,16 +309,25 @@ impl HarnessApi {
                 required_str(&payload, "scheduleId")?,
                 required_bool(&payload, "enabled")?,
             )?),
+            "schedule.list" => to_value(self.services.list_schedules()?),
+            "schedule.get" => to_value(
+                self.services
+                    .get_schedule(required_str(&payload, "scheduleId")?)?,
+            ),
+            "schedule.delete" => to_value(
+                self.services
+                    .delete_schedule(required_str(&payload, "scheduleId")?)?,
+            ),
             "feedback.record" => to_value(self.services.record_feedback(
-                required_string(&payload, "sessionId")?,
-                required_string(&payload, "kind")?,
-                required_string(&payload, "text")?,
+                optional_string(&payload, "sessionId"),
+                optional_i32(&payload, "rating"),
+                optional_string(&payload, "note").or_else(|| optional_string(&payload, "text")),
             )?),
             "identity.get" => to_value(self.services.identity()?),
-            "identity.bindAccount" => to_value(
-                self.services
-                    .bind_account(required_string(&payload, "accountId")?)?,
-            ),
+            "identity.bindAccount" => to_value(self.services.bind_identity_account(
+                Some(required_string(&payload, "accountId")?),
+                optional_string(&payload, "displayName"),
+            )?),
 
             "team.create" => to_value(
                 self.services.create_team(
@@ -324,15 +342,20 @@ impl HarnessApi {
             ),
             "team.addTask" => to_value(self.services.add_team_task(
                 required_str(&payload, "teamId")?,
-                required_string(&payload, "text")?,
-                optional_string(&payload, "assigneeAgentId"),
-            )?),
-            "team.sendMessage" => to_value(self.services.send_team_message(
-                required_str(&payload, "teamId")?,
-                required_string(&payload, "fromAgentId")?,
-                optional_string(&payload, "toAgentId"),
+                optional_string(&payload, "assigneeAgentId").unwrap_or_else(|| "unassigned".into()),
                 required_string(&payload, "text")?,
             )?),
+            "team.sendMessage" => to_value(
+                self.services.send_team_message(
+                    required_str(&payload, "teamId")?,
+                    required_string(&payload, "fromAgentId")?,
+                    optional_string(&payload, "toAgentId"),
+                    payload
+                        .get("message")
+                        .cloned()
+                        .unwrap_or(Value::String(required_string(&payload, "text")?)),
+                )?,
+            ),
 
             "skill.register" => {
                 self.services
@@ -349,43 +372,43 @@ impl HarnessApi {
                 self.advanced
                     .register_permission_preset(from_payload::<PermissionPreset>(payload)?)?,
             ),
-            "interaction.permissionPreset.list" => {
-                to_value(self.advanced.permission_presets()?)
-            }
+            "interaction.permissionPreset.list" => to_value(self.advanced.permission_presets()?),
             "interaction.permissionPreset.activate" => to_value(
-                self.advanced.activate_permission_preset(required_str(
-                    &payload,
-                    "presetId",
-                )?)?,
+                self.advanced
+                    .activate_permission_preset(required_str(&payload, "presetId")?)?,
             ),
             "interaction.permissionPreset.current" => {
                 to_value(self.advanced.active_permission_preset()?)
             }
-            "interaction.question.create" => to_value(self.advanced.ask_question(
-                required_string(&payload, "sessionId")?,
-                optional_string(&payload, "agentId"),
-                required_string(&payload, "prompt")?,
-                payload
-                    .get("options")
-                    .cloned()
-                    .map(from_payload::<Vec<QuestionOption>>)
-                    .transpose()?
-                    .unwrap_or_default(),
-                payload
-                    .get("allowFreeform")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            )?),
+            "interaction.question.create" => to_value(
+                self.advanced.ask_question(
+                    required_string(&payload, "sessionId")?,
+                    optional_string(&payload, "agentId"),
+                    required_string(&payload, "prompt")?,
+                    payload
+                        .get("options")
+                        .cloned()
+                        .map(from_payload::<Vec<QuestionOption>>)
+                        .transpose()?
+                        .unwrap_or_default(),
+                    payload
+                        .get("allowFreeform")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )?,
+            ),
             "interaction.question.answer" => to_value(self.advanced.answer_question(
                 required_str(&payload, "questionId")?,
                 payload.get("answer").cloned().unwrap_or(Value::Null),
             )?),
-            "interaction.question.list" => to_value(self.advanced.questions(
-                payload
-                    .get("pendingOnly")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            )?),
+            "interaction.question.list" => to_value(
+                self.advanced.questions(
+                    payload
+                        .get("pendingOnly")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )?,
+            ),
 
             "bundle.register" => to_value(
                 self.advanced
@@ -401,10 +424,11 @@ impl HarnessApi {
                 self.advanced
                     .resolve_preset(required_str(&payload, "presetId")?)?,
             ),
-            "extension.register" => to_value(
-                self.advanced
-                    .register_extension(from_payload::<ExtensionDefinition>(payload)?)?,
-            ),
+            "extension.register" => to_value(self.advanced.register_extension(from_payload::<
+                ExtensionDefinition,
+            >(
+                payload
+            )?)?),
             "extension.list" => to_value(self.advanced.extensions()?),
             "extension.setEnabled" => to_value(self.advanced.set_extension_enabled(
                 required_str(&payload, "extensionId")?,
@@ -491,6 +515,26 @@ fn required_bool(payload: &Value, key: &str) -> HarnessResult<bool> {
         .get(key)
         .and_then(Value::as_bool)
         .ok_or_else(|| HarnessError::InvalidConfig(format!("{key} is required")))
+}
+
+fn todo_done(payload: &Value) -> HarnessResult<bool> {
+    if let Some(done) = payload.get("done").and_then(Value::as_bool) {
+        return Ok(done);
+    }
+    match required_str(payload, "status")? {
+        "done" | "completed" | "complete" => Ok(true),
+        "pending" | "open" | "todo" => Ok(false),
+        status => Err(HarnessError::InvalidConfig(format!(
+            "unsupported todo status: {status}"
+        ))),
+    }
+}
+
+fn optional_i32(payload: &Value, key: &str) -> Option<i32> {
+    payload
+        .get(key)
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
 }
 
 fn optional_usize(payload: &Value, key: &str) -> Option<usize> {
