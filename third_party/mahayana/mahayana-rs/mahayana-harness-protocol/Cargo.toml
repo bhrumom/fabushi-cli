@@ -1,0 +1,19 @@
+[package]
+name = "mahayana-harness-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stable JSON protocol for the Rust-native Mahayana Harness."
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+mahayana-core.workspace = true
+mahayana-harness.workspace = true
+mahayana-harness-advanced.workspace = true
+mahayana-harness-services.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

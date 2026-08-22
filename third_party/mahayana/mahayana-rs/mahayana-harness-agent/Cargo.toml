@@ -1,0 +1,17 @@
+[package]
+name = "mahayana-harness-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Adapter from the Mahayana AgentBackend to the Rust-native Harness event loop."
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait.workspace = true
+mahayana-agent.workspace = true
+mahayana-core.workspace = true
+mahayana-harness.workspace = true
+serde_json.workspace = true

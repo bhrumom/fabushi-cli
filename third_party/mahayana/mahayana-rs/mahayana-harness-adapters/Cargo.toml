@@ -1,0 +1,20 @@
+[package]
+name = "mahayana-harness-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Concrete adapters from Mahayana Harness capability seams to existing Mahayana hosts."
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait.workspace = true
+mahayana-core.workspace = true
+mahayana-harness.workspace = true
+mahayana-harness-services.workspace = true
+mahayana-tool-host.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
