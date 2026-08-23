@@ -9,14 +9,19 @@ publish = false
 name = "mahayana"
 path = "src/main.rs"
 
+[features]
+default = []
+codex-compat = ["dep:codex-arg0", "dep:codex-cli"]
+
 [dependencies]
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
-codex-arg0.workspace = true
-codex-cli.workspace = true
+codex-arg0 = { workspace = true, optional = true }
+codex-cli = { workspace = true, optional = true }
 codex-core-plugins.workspace = true
 codex-tui.workspace = true
 crossterm.workspace = true
+flate2.workspace = true
 mahayana-core.workspace = true
 mahayana-feature-host = { workspace = true, features = ["production"] }
 mahayana-host.workspace = true
@@ -27,10 +32,12 @@ mahayana-miniapp-protocol.workspace = true
 mahayana-platform-core.workspace = true
 mahayana-plugin-host.workspace = true
 mahayana-plugin-runtime.workspace = true
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 rpassword.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
 url.workspace = true
