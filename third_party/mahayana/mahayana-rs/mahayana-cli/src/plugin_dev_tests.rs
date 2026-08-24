@@ -1,4 +1,5 @@
 use super::*;
+use crate::pack_plugin_bundle_tar_gz;
 
 fn temporary_repository(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mahayana-cli-{label}-{}", uuid::Uuid::new_v4()))
@@ -206,11 +207,7 @@ fn marketplace_install_extracts_a_verified_pages_bundle_into_the_repository() {
     )
     .expect("initialize source plugin");
     let source_plugin = source_repository.join(".agents/plugins/plugins/market-plugin");
-    let archive = codex_core_plugins::plugin_bundle_archive::pack_plugin_bundle_tar_gz(
-        &source_plugin,
-        50 * 1024 * 1024,
-    )
-    .expect("pack plugin");
+    let archive = pack_plugin_bundle_tar_gz(&source_plugin, 50 * 1024 * 1024).expect("pack plugin");
 
     let destination_repository = temporary_repository("market-destination");
     fs::create_dir_all(&destination_repository).expect("create destination repository");
@@ -241,11 +238,7 @@ fn marketplace_install_rejects_manifest_version_mismatch() {
     )
     .expect("initialize source plugin");
     let source_plugin = source_repository.join(".agents/plugins/plugins/versioned-plugin");
-    let archive = codex_core_plugins::plugin_bundle_archive::pack_plugin_bundle_tar_gz(
-        &source_plugin,
-        50 * 1024 * 1024,
-    )
-    .expect("pack plugin");
+    let archive = pack_plugin_bundle_tar_gz(&source_plugin, 50 * 1024 * 1024).expect("pack plugin");
     let destination_repository = temporary_repository("market-version-destination");
     fs::create_dir_all(&destination_repository).expect("create destination repository");
 

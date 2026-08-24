@@ -511,6 +511,7 @@ fn main() {
     }
 }
 
+#[cfg(any(feature = "codex-compat", test))]
 fn should_run_embedded_agent_cli(args: &[OsString]) -> bool {
     let Some(command) = args.first().and_then(|value| value.to_str()) else {
         return false;
@@ -524,6 +525,7 @@ fn should_run_embedded_agent_cli(args: &[OsString]) -> bool {
     !matches!(command, "-h" | "--help" | "-V" | "--version") && !is_product_command(command)
 }
 
+#[cfg(any(feature = "codex-compat", test))]
 fn is_product_command(command: &str) -> bool {
     matches!(
         command,
@@ -1930,6 +1932,7 @@ fn should_print_completed_text(print_stream: bool, streamed_output: bool, comple
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    #[cfg(feature = "codex-compat")]
     use super::Cli;
     use super::merge_completed_text;
     use super::should_print_completed_text;
