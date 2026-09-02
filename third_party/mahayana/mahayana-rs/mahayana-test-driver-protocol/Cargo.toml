@@ -1,0 +1,18 @@
+[package]
+name = "mahayana-test-driver-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Debug-only versioned test-driver protocol for Mahayana product automation."
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions = "1"

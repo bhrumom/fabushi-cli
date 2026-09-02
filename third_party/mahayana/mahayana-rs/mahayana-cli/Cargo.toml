@@ -9,9 +9,15 @@ publish = false
 name = "mahayana"
 path = "src/main.rs"
 
+[[bin]]
+name = "mahayana-test-driver"
+path = "src/bin/mahayana-test-driver.rs"
+required-features = ["test-driver"]
+
 [features]
 default = []
 codex-compat = ["dep:codex-arg0", "dep:codex-cli"]
+test-driver = ["dep:mahayana-test-driver-protocol"]
 
 [dependencies]
 anyhow.workspace = true
@@ -27,11 +33,13 @@ mahayana-feature-host = { workspace = true, features = ["production"] }
 mahayana-host.workspace = true
 mahayana-host-protocol.workspace = true
 mahayana-ffi = { path = "../mahayana-ffi" }
+mahayana-mcp-runtime.workspace = true
 mahayana-product = { package = "mahayana-platform-client", path = "../mahayana-product" }
 mahayana-miniapp-protocol.workspace = true
 mahayana-platform-core.workspace = true
 mahayana-plugin-host.workspace = true
 mahayana-plugin-runtime.workspace = true
+mahayana-test-driver-protocol = { path = "../mahayana-test-driver-protocol", optional = true }
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 rpassword.workspace = true
 serde_json.workspace = true
@@ -45,3 +53,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 insta = "1.46.3"
+mahayana-test-driver-protocol = { path = "../mahayana-test-driver-protocol" }
