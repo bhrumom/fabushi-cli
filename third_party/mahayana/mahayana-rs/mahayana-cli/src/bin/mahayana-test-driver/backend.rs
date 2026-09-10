@@ -204,8 +204,12 @@ impl ProductBackend {
                 format!("plugin {plugin_id} must be installed before plugin.update"),
             ));
         }
+        let installer_platform = match platform {
+            "ios" | "android" => "mobile",
+            platform => platform,
+        };
         let receipt = installer
-            .install(&release, platform, PREFERRED_PLUGIN_RUNTIMES)
+            .install(&release, installer_platform, PREFERRED_PLUGIN_RUNTIMES)
             .map_err(|error| {
                 TestDriverError::new(
                     "plugin_install_failed",
