@@ -10,12 +10,14 @@ use mahayana_platform_core::HostPlatform;
 use mahayana_platform_core::canonical_json_bytes;
 use mahayana_plugin_host::LocalPlugin;
 use mahayana_product::default_mahayana_home;
+use semver::Version;
 use serde_json::Value;
 use serde_json::json;
 #[cfg(test)]
 use sha2::Digest;
 #[cfg(test)]
 use sha2::Sha256;
+use std::cmp::Ordering;
 use std::env;
 use std::fs;
 use std::path::Component;
@@ -241,17 +243,54 @@ pub fn install_marketplace_bundle(
     version: &str,
     archive: &[u8],
 ) -> Result<Value, String> {
+    install_or_update_marketplace_bundle(repository, plugin_id, version, archive, false)
+}
+
+pub fn update_marketplace_bundle(
+    repository: &Path,
+    plugin_id: &str,
+    version: &str,
+    archive: &[u8],
+) -> Result<Value, String> {
+    install_or_update_marketplace_bundle(repository, plugin_id, version, archive, true)
+}
+
+fn install_or_update_marketplace_bundle(
+    repository: &Path,
+    plugin_id: &str,
+    version: &str,
+    archive: &[u8],
+    update: bool,
+) -> Result<Value, String> {
     let repository = absolute_path(repository)?;
     let plugin_id = normalized_name(plugin_id)?;
     let plugins_root = repository.join(".agents/plugins/plugins");
     let destination = plugins_root.join(&plugin_id);
-    if destination.exists() {
+    if !update && destination.exists() {
         return Err(format!(
             "插件 {plugin_id} 已安装；请先明确卸载或使用更新流程"
         ));
     }
+    if update && !destination.is_dir() {
+        return Err(format!("插件 {plugin_id} 尚未安装，不能执行更新"));
+    }
+    if update {
+        let current = LocalPlugin::load(&destination)
+            .map_err(|error| format!("无法读取已安装插件 {plugin_id}：{error}"))?
+            .legacy
+            .version
+            .ok_or_else(|| format!("已安装插件 {plugin_id} 没有版本号，拒绝更新"))?;
+        if compare_marketplace_versions(version, &current) != Ordering::Greater {
+            return Err(format!(
+                "拒绝把插件 {plugin_id} 从 {current} 更新到 {version}：候选版本不是更高版本"
+            ));
+        }
+    }
     fs::create_dir_all(&plugins_root).map_err(|error| error.to_string())?;
     let staging = plugins_root.join(format!(".install-{}-{}", plugin_id, uuid::Uuid::new_v4()));
+    let backup = plugins_root.join(format!(".backup-{}-{}", plugin_id, uuid::Uuid::new_v4()));
+    let mut moved_existing = false;
+    let mut marketplace_added = false;
     let result = (|| {
         unpack_plugin_bundle_tar_gz(archive, &staging, 100 * 1024 * 1024)
             .map_err(|error| error.to_string())?;
@@ -269,20 +308,30 @@ pub fn install_marketplace_bundle(
             ));
         }
         let validation = validate_plugin(&staging)?;
+        if update {
+            fs::rename(&destination, &backup).map_err(|error| error.to_string())?;
+            moved_existing = true;
+        }
         fs::rename(&staging, &destination).map_err(|error| error.to_string())?;
         let marketplace_path = repository.join(".agents/plugins/marketplace.json");
-        update_marketplace(&marketplace_path, &plugin_id)?;
+        if !marketplace_contains(&marketplace_path, &plugin_id)? {
+            update_marketplace(&marketplace_path, &plugin_id)?;
+            marketplace_added = true;
+        }
         if let Err(error) =
             sync_installed_marketplace_with_codex(&repository, &marketplace_path, &plugin_id)
         {
-            let _ = remove_marketplace_entry(&marketplace_path, &plugin_id);
+            if marketplace_added {
+                let _ = remove_marketplace_entry(&marketplace_path, &plugin_id);
+            }
             return Err(error);
         }
         Ok(json!({
             "installed": true,
+            "updated": update,
             "pluginId": plugin_id,
             "version": version,
-            "source": "independent-pages-or-worker",
+            "source": "github-immutable-marketplace",
             "pluginRoot": destination,
             "validation": validation,
         }))
@@ -290,10 +339,62 @@ pub fn install_marketplace_bundle(
     if result.is_err() && staging.exists() {
         let _ = fs::remove_dir_all(&staging);
     }
-    if result.is_err() && destination.exists() {
-        let _ = fs::remove_dir_all(&destination);
+    if result.is_err() {
+        if destination.exists() && (moved_existing || !update) {
+            let _ = fs::remove_dir_all(&destination);
+        }
+        if moved_existing && backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+    } else if moved_existing && backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
     }
     result
+}
+
+fn marketplace_contains(path: &Path, plugin_id: &str) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let marketplace: Value =
+        serde_json::from_str(&fs::read_to_string(path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("invalid existing marketplace: {error}"))?;
+    Ok(marketplace
+        .get("plugins")
+        .and_then(Value::as_array)
+        .is_some_and(|plugins| {
+            plugins
+                .iter()
+                .any(|plugin| plugin.get("name").and_then(Value::as_str) == Some(plugin_id))
+        }))
+}
+
+fn compare_marketplace_versions(candidate: &str, current: &str) -> Ordering {
+    match (Version::parse(candidate), Version::parse(current)) {
+        (Ok(candidate), Ok(current)) => candidate.cmp(&current),
+        _ => {
+            let tokenize = |value: &str| {
+                value
+                    .split(['.', '+', '-'])
+                    .map(|part| part.parse::<u64>().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            };
+            let candidate_parts = tokenize(candidate);
+            let current_parts = tokenize(current);
+            for index in 0..candidate_parts.len().max(current_parts.len()) {
+                let left = candidate_parts.get(index).copied().unwrap_or_default();
+                let right = current_parts.get(index).copied().unwrap_or_default();
+                if left != right {
+                    return left.cmp(&right);
+                }
+            }
+            match (candidate.contains('-'), current.contains('-')) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => Ordering::Equal,
+            }
+        }
+    }
 }
 
 #[cfg(test)]

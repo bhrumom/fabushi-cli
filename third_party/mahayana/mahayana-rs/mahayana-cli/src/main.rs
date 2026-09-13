@@ -48,6 +48,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+use url::Url;
 
 mod chat_tui;
 mod plugin_archive;
@@ -372,6 +373,14 @@ enum MarketplaceCommand {
     },
     /// Download, verify, and safely install an approved plugin.
     Install {
+        plugin_id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+    },
+    /// Download, verify, and safely update an installed approved plugin.
+    Update {
         plugin_id: String,
         #[arg(long)]
         version: Option<String>,
@@ -1107,71 +1116,136 @@ fn verified_marketplace_archive(
     {
         return Err("市场版本元数据与请求的插件或版本不一致".into());
     }
-    if let Some(release_value) = metadata.get("releaseManifest")
-        && release_value.get("protocol").and_then(Value::as_str)
-            == Some("mahayana.external-release.v1")
-    {
-        let release = serde_json::from_value::<ExternalReleaseManifest>(release_value.clone())
-            .map_err(|error| format!("市场 external release manifest 无效：{error}"))?;
-        release.validate().map_err(|error| error.to_string())?;
-        if release.plugin_id != plugin_id || release.version != version {
-            return Err("市场 external release manifest 身份与请求不一致".into());
-        }
-        let artifact = release
-            .select_artifact(
-                "cli",
-                &["native", "desktop-stdio", "deepseek-js", "web-wasm", "mcp"],
-            )
-            .map_err(|error| error.to_string())?;
-        let archive = ArtifactResolver::new()
-            .map_err(|error| error.to_string())?
-            .download_verified(artifact)
-            .map_err(|error| error.to_string())?;
-        return Ok(VerifiedMarketplaceArchive {
-            version,
-            package_sha256: artifact.sha256.to_ascii_lowercase(),
-            package_size: artifact.size,
-            format: artifact.format.clone(),
-            archive,
-        });
+    let release_value = metadata
+        .get("releaseManifest")
+        .filter(|value| {
+            value.get("protocol").and_then(Value::as_str) == Some("mahayana.external-release.v1")
+        })
+        .ok_or_else(|| "市场版本没有提供可验证的 GitHub external release manifest".to_string())?;
+    let install = metadata
+        .get("install")
+        .or_else(|| release_value.get("install"))
+        .ok_or_else(|| "市场版本没有提供统一 GitHub 安装合同".to_string())?;
+    validate_marketplace_install_contract(install, plugin_id, &version)?;
+    let release = serde_json::from_value::<ExternalReleaseManifest>(release_value.clone())
+        .map_err(|error| format!("市场 external release manifest 无效：{error}"))?;
+    release.validate().map_err(|error| error.to_string())?;
+    if release.plugin_id != plugin_id || release.version != version {
+        return Err("市场 external release manifest 身份与请求不一致".into());
     }
-
-    // Legacy releases keep their historical metadata shape. The legacy
-    // download endpoint is now only a 307 compatibility redirect to the
-    // publisher's external HTTPS artifact; no marketplace bytes are stored.
-    let expected_sha256 = metadata
-        .get("packageSha256")
-        .and_then(Value::as_str)
-        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| "市场版本元数据缺少有效 packageSha256".to_string())?
-        .to_ascii_lowercase();
-    let expected_size = metadata
-        .get("packageSize")
-        .and_then(Value::as_u64)
-        .filter(|size| *size > 0 && *size <= 50 * 1024 * 1024)
-        .ok_or_else(|| "市场版本元数据缺少有效 packageSize".to_string())?;
-    let archive = client
-        .download_marketplace_plugin(
-            plugin_id,
-            &version,
-            usize::try_from(expected_size)
-                .map_err(|_| "市场插件包大小超出当前平台限制".to_string())?,
+    let artifact = release
+        .select_artifact(
+            "cli",
+            &["native", "desktop-stdio", "deepseek-js", "web-wasm", "mcp"],
         )
         .map_err(|error| error.to_string())?;
-    if archive.len() as u64 != expected_size {
-        return Err("下载的插件包大小与市场版本元数据不一致".into());
-    }
-    let actual_sha256 = format!("{:x}", Sha256::digest(&archive));
-    if actual_sha256 != expected_sha256 {
-        return Err("云端插件包哈希与市场版本元数据不一致".into());
-    }
+    let archive = ArtifactResolver::new()
+        .map_err(|error| error.to_string())?
+        .download_verified(artifact)
+        .map_err(|error| error.to_string())?;
     Ok(VerifiedMarketplaceArchive {
         version,
-        package_sha256: actual_sha256,
-        package_size: expected_size,
-        format: ArtifactFormat::TarGz,
+        package_sha256: artifact.sha256.to_ascii_lowercase(),
+        package_size: artifact.size,
+        format: artifact.format.clone(),
         archive,
     })
+}
+
+fn validate_marketplace_install_contract(
+    install: &Value,
+    plugin_id: &str,
+    version: &str,
+) -> Result<(), String> {
+    let source = install
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "市场安装合同缺少 source".to_string())?;
+    let repository = source
+        .get("repository")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "市场安装合同缺少 GitHub repository".to_string())?;
+    let repository_url = Url::parse(repository).map_err(|error| error.to_string())?;
+    let repository_parts = repository_url
+        .path()
+        .trim_matches('/')
+        .split('/')
+        .collect::<Vec<_>>();
+    if repository_url.scheme() != "https"
+        || !repository_url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        || repository_url.username() != ""
+        || repository_url.password().is_some()
+        || repository_url.port().is_some()
+        || repository_url.query().is_some()
+        || repository_url.fragment().is_some()
+        || repository_parts.len() != 2
+        || repository_parts.iter().any(|part| part.is_empty())
+        || source
+            .get("sourceRef")
+            .and_then(Value::as_str)
+            .is_none_or(|value| {
+                value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        || source
+            .get("marketplaceHostsPackage")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err("市场安装合同必须固定到公开 GitHub commit，且市场不得托管包字节".into());
+    }
+    if install.get("protocol").and_then(Value::as_str) != Some("fabushi.marketplace.install.v1")
+        || install.get("strategy").and_then(Value::as_str) != Some("github-immutable")
+        || install.get("pluginId").and_then(Value::as_str) != Some(plugin_id)
+        || install.get("version").and_then(Value::as_str) != Some(version)
+    {
+        return Err("市场安装合同身份或策略无效".into());
+    }
+    let artifacts = install
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .filter(|artifacts| !artifacts.is_empty())
+        .ok_or_else(|| "市场安装合同没有 artifacts".to_string())?;
+    for artifact in artifacts {
+        let source = artifact
+            .get("source")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "市场 artifact 缺少 source".to_string())?;
+        let github_artifact = match source.get("type").and_then(Value::as_str) {
+            Some("https") => source
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| Url::parse(url).ok())
+                .is_some_and(|url| {
+                    url.scheme() == "https"
+                        && url.host_str().is_some_and(|host| {
+                            host.eq_ignore_ascii_case("github.com")
+                                || host.eq_ignore_ascii_case("raw.githubusercontent.com")
+                        })
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.port().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                }),
+            Some("github-release") => true,
+            _ => false,
+        };
+        if !github_artifact {
+            return Err("市场 artifact 必须来自 GitHub HTTPS 或 GitHub Release".into());
+        }
+    }
+    if install
+        .get("update")
+        .and_then(Value::as_object)
+        .and_then(|update| update.get("allowDowngrade"))
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Err("市场安装合同必须禁止降级".into());
+    }
+    Ok(())
 }
 
 fn marketplace_command(command: MarketplaceCommand) -> Result<(), String> {
@@ -1247,6 +1321,25 @@ fn marketplace_command(command: MarketplaceCommand) -> Result<(), String> {
                 );
             }
             print_json(&plugin_dev::install_marketplace_bundle(
+                &repository,
+                &plugin_id,
+                &verified.version,
+                &verified.archive,
+            )?)
+        }
+        MarketplaceCommand::Update {
+            plugin_id,
+            version,
+            repository,
+        } => {
+            let verified = verified_marketplace_archive(&client, &plugin_id, version.as_deref())?;
+            if verified.format != ArtifactFormat::TarGz {
+                return Err(
+                    "Codex marketplace repository update currently requires a tar.gz CLI artifact"
+                        .into(),
+                );
+            }
+            print_json(&plugin_dev::update_marketplace_bundle(
                 &repository,
                 &plugin_id,
                 &verified.version,

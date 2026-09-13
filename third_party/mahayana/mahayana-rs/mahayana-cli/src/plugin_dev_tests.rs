@@ -215,13 +215,77 @@ fn marketplace_install_extracts_a_verified_pages_bundle_into_the_repository() {
         install_marketplace_bundle(&destination_repository, "market-plugin", "0.1.0", &archive)
             .expect("install pages bundle");
     assert_eq!(receipt["installed"], true);
-    assert_eq!(receipt["source"], "independent-pages-or-worker");
+    assert_eq!(receipt["updated"], false);
+    assert_eq!(receipt["source"], "github-immutable-marketplace");
     assert!(
         destination_repository
             .join(".agents/plugins/plugins/market-plugin/.codex-plugin/plugin.json")
             .is_file()
     );
     validate_path(&destination_repository).expect("validate installed marketplace");
+
+    fs::remove_dir_all(source_repository).expect("remove source repository");
+    fs::remove_dir_all(destination_repository).expect("remove destination repository");
+}
+
+#[test]
+fn marketplace_update_replaces_the_package_and_rejects_downgrades() {
+    let source_repository = temporary_repository("market-update-source");
+    init_repository(
+        &source_repository,
+        "Update Plugin",
+        Some("更新插件"),
+        PluginTemplate::Conversational,
+    )
+    .expect("initialize source plugin");
+    let source_plugin = source_repository.join(".agents/plugins/plugins/update-plugin");
+    let initial_archive =
+        pack_plugin_bundle_tar_gz(&source_plugin, 50 * 1024 * 1024).expect("pack initial plugin");
+
+    let destination_repository = temporary_repository("market-update-destination");
+    fs::create_dir_all(&destination_repository).expect("create destination repository");
+    install_marketplace_bundle(
+        &destination_repository,
+        "update-plugin",
+        "0.1.0",
+        &initial_archive,
+    )
+    .expect("install initial plugin");
+
+    let manifest_path = source_plugin.join(".codex-plugin/plugin.json");
+    let mut manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read source plugin manifest"),
+    )
+    .expect("parse source plugin manifest");
+    manifest["version"] = json!("0.2.0");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("serialize updated manifest") + "\n",
+    )
+    .expect("write updated manifest");
+    let updated_archive =
+        pack_plugin_bundle_tar_gz(&source_plugin, 50 * 1024 * 1024).expect("pack updated plugin");
+    let receipt = update_marketplace_bundle(
+        &destination_repository,
+        "update-plugin",
+        "0.2.0",
+        &updated_archive,
+    )
+    .expect("update installed plugin");
+    assert_eq!(receipt["updated"], true);
+    let installed: Value = serde_json::from_str(
+        &fs::read_to_string(
+            destination_repository
+                .join(".agents/plugins/plugins/update-plugin/.codex-plugin/plugin.json"),
+        )
+        .expect("read updated installed manifest"),
+    )
+    .expect("parse updated installed manifest");
+    assert_eq!(installed["version"], "0.2.0");
+
+    let error = update_marketplace_bundle(&destination_repository, "update-plugin", "0.1.5", &[])
+        .expect_err("reject marketplace downgrade");
+    assert!(error.contains("候选版本不是更高版本"));
 
     fs::remove_dir_all(source_repository).expect("remove source repository");
     fs::remove_dir_all(destination_repository).expect("remove destination repository");
