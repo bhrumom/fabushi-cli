@@ -51,6 +51,7 @@ use std::time::Duration;
 use url::Url;
 
 mod chat_tui;
+mod device_agent;
 mod plugin_archive;
 mod plugin_dev;
 mod plugin_dev_template;
@@ -148,6 +149,11 @@ enum CliCommand {
     Review(EmbeddedAgentArgs),
     /// 管理外部 MCP 服务。
     Mcp(EmbeddedAgentArgs),
+    /// 管理本机与 Fabushi 官方 MCP 的动态设备连接。
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
     /// 以 stdio 启动大乘 MCP 服务。
     McpServer(EmbeddedAgentArgs),
     /// 启动或管理大乘 App Server。
@@ -218,6 +224,19 @@ enum CliCommand {
         #[command(subcommand)]
         command: PurchasesCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeviceCommand {
+    /// 启动轻量后台设备 Agent；未登录时保持空闲，登录后自动上线。
+    Start,
+    /// 查看设备 Agent、本机稳定设备 ID 和官方网关状态。
+    Status,
+    /// 请求后台设备 Agent 退出。
+    Stop,
+    /// 前台运行设备 Agent（安装器/服务管理器使用）。
+    #[command(hide = true)]
+    Serve,
 }
 
 #[derive(Debug, Subcommand)]
@@ -551,6 +570,7 @@ fn is_product_command(command: &str) -> bool {
             | "send"
             | "chat"
             | "connector"
+            | "device"
             | "skill"
             | "bot"
             | "listener"
@@ -592,7 +612,7 @@ fn run(codex_executable_path: Option<&Path>, cli: Cli) -> Result<(), String> {
         Some(CliCommand::Login { args }) => login(args),
         Some(CliCommand::Register { args }) => register(args),
         Some(CliCommand::SendCode { email }) => send_verification_code(vec![email]),
-        Some(CliCommand::Logout) => product_command("mahayana.auth.logout", json!({})),
+        Some(CliCommand::Logout) => logout_command(),
         Some(CliCommand::Auth) => product_command("mahayana.auth.status", json!({})),
         Some(CliCommand::Usage) => model_usage_command(),
         Some(CliCommand::Status) => with_runtime(codex_executable_path, |runtime| {
@@ -660,6 +680,7 @@ fn run(codex_executable_path: Option<&Path>, cli: Cli) -> Result<(), String> {
         Some(CliCommand::Review(args)) => run_embedded_agent_command(&["review"], args),
         Some(CliCommand::Mcp(args)) => run_embedded_agent_command(&["mcp"], args),
         Some(CliCommand::McpServer(args)) => run_embedded_agent_command(&["mcp-server"], args),
+        Some(CliCommand::Device { command }) => device_command(command),
         Some(CliCommand::AppServer(args)) => run_embedded_agent_command(&["app-server"], args),
         Some(CliCommand::RemoteControl(args)) => {
             run_embedded_agent_command(&["remote-control"], args)
@@ -1643,6 +1664,27 @@ fn purchases_command(command: PurchasesCommand) -> Result<(), String> {
     print_json(&response)
 }
 
+fn logout_command() -> Result<(), String> {
+    let result = product_command("mahayana.auth.logout", json!({}));
+    let _ = device_agent::request_stop();
+    result
+}
+
+fn device_command(command: DeviceCommand) -> Result<(), String> {
+    match command {
+        DeviceCommand::Start => print_json(&device_agent::ensure_started()?),
+        DeviceCommand::Status => print_json(&device_agent::status()?),
+        DeviceCommand::Stop => print_json(&device_agent::request_stop()?),
+        DeviceCommand::Serve => device_agent::serve(),
+    }
+}
+
+fn ensure_device_agent_after_login() {
+    if let Err(error) = device_agent::ensure_started() {
+        eprintln!("警告：账号已登录，但设备 Agent 启动失败：{error}");
+    }
+}
+
 fn miniapp_command(codex_executable_path: Option<&Path>, args: Vec<String>) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("registry") => product_command("mahayana.miniapps.registry", json!({})),
@@ -1690,7 +1732,8 @@ fn test_account_login(args: &[String]) -> Result<(), String> {
     MahayanaProductClient::default()
         .store_test_account_session(&token)
         .map_err(|error| error.to_string())?;
-    println!("测试账号 TestAccount 登录成功。会话已加密保存，AI 测试额度不设日常上限。");
+    ensure_device_agent_after_login();
+    println!("测试账号 TestAccount 登录成功。会话已加密保存；本机将自动注册为同账号可控设备。");
     Ok(())
 }
 
@@ -1701,16 +1744,18 @@ fn password_login(args: &[String]) -> Result<(), String> {
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "用法：mahayana login password <用户名> [--password-stdin]".to_string())?;
     let password = read_password(args.get(1).map(String::as_str))?;
+    let device_id = device_agent::current_device_id()?;
     let response = MahayanaProductClient::default()
         .execute(
             "mahayana.auth.password.login",
-            &json!({"username": username, "password": password}),
+            &json!({"username": username, "password": password, "deviceId": device_id}),
         )
         .map_err(|error| error.to_string())?;
     if response.get("sessionStored").and_then(Value::as_bool) != Some(true) {
         return Err("官方登录没有返回可保存的软件会话".into());
     }
-    println!("登录成功。App 与 CLI 将共用同一大乘账号会话；无需 OpenAI 登录。");
+    ensure_device_agent_after_login();
+    println!("登录成功。App 与 CLI 将共用同一大乘账号会话；本机设备 Agent 已自动启动。");
     Ok(())
 }
 
@@ -1759,8 +1804,12 @@ fn read_password(mode: Option<&str>) -> Result<String, String> {
 
 fn alipay_login() -> Result<(), String> {
     let client = MahayanaProductClient::default();
+    let device_id = device_agent::current_device_id()?;
     let authorization = client
-        .execute("mahayana.auth.alipay.start", &json!({"platform": "cli"}))
+        .execute(
+            "mahayana.auth.alipay.start",
+            &json!({"platform": "cli", "deviceId": device_id}),
+        )
         .map_err(|error| error.to_string())?;
     let url = authorization
         .get("loginUrl")
@@ -1780,7 +1829,8 @@ fn alipay_login() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         match response.get("status").and_then(Value::as_str) {
             Some("complete") => {
-                println!("登录成功。软件会话已安全保存；Codex 不需要 OpenAI 登录。");
+                ensure_device_agent_after_login();
+                println!("登录成功。软件会话已安全保存；本机设备 Agent 已自动启动。");
                 return Ok(());
             }
             Some("expired") | Some("failed") => {

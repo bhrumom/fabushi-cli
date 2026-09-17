@@ -28,6 +28,7 @@ codex-core-plugins = { package = "mahayana-plugin-archive-compat", path = "../ma
 codex-tui = { package = "mahayana-tui-compat", path = "../mahayana-tui-compat" }
 crossterm.workspace = true
 flate2.workspace = true
+futures-util = "0.3"
 mahayana-core.workspace = true
 mahayana-feature-host = { workspace = true, features = ["production"] }
 mahayana-host.workspace = true
@@ -42,12 +43,14 @@ mahayana-plugin-runtime.workspace = true
 mahayana-test-driver-protocol = { path = "../mahayana-test-driver-protocol", optional = true }
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 rpassword.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json.workspace = true
 semver.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 unicode-width.workspace = true
 url.workspace = true
 uuid.workspace = true
