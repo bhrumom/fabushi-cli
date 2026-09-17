@@ -4,8 +4,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-#[cfg(windows)]
-use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -148,46 +146,38 @@ fn process_is_running(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        // `tasklist` can occasionally block for minutes on Windows runners while
-        // endpoint/security services initialise. Device start/status must never
-        // inherit that unbounded wait because one-line installation calls it.
-        let mut child = match Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => return false,
-        };
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        return false;
-                    }
-                    let mut stdout = String::new();
-                    if let Some(mut pipe) = child.stdout.take() {
-                        let _ = pipe.read_to_string(&mut stdout);
-                    }
-                    return stdout.contains(&pid.to_string());
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-            }
+        windows_process_is_running(pid)
+    }
+}
+
+
+#[cfg(windows)]
+fn windows_process_is_running(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    // SAFETY: the handle is opened read-only for a PID owned by this CLI, every
+    // successful OpenProcess handle is closed exactly once, and the exit-code
+    // pointer refers to a live local u32 for the duration of the call.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
         }
+        let mut exit_code = 0_u32;
+        let ok = GetExitCodeProcess(handle, &mut exit_code as *mut u32) != 0;
+        let _ = CloseHandle(handle);
+        ok && exit_code == STILL_ACTIVE
     }
 }
 
@@ -278,10 +268,17 @@ pub fn ensure_started() -> Result<Value, String> {
     }
     command.env("DEVICE_ID", current_device_id()?);
     let child = command.spawn().map_err(|error| error.to_string())?;
+    let spawned_pid = child.id();
     std::thread::sleep(Duration::from_millis(250));
-    let mut result = status()?;
-    result["spawnedPid"] = json!(child.id());
-    Ok(result)
+    Ok(json!({
+        "running": process_is_running(spawned_pid),
+        "deviceId": current_device_id()?,
+        "ephemeral": env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true"),
+        "gateway": OFFICIAL_DEVICE_GATEWAY_URL,
+        "pid": spawned_pid.to_string(),
+        "log": log_path(),
+        "spawnedPid": spawned_pid,
+    }))
 }
 
 pub fn request_stop() -> Result<Value, String> {
