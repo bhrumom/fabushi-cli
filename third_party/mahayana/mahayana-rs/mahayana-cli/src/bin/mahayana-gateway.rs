@@ -1,6 +1,6 @@
 use mahayana_core::RuntimeEvent;
 use mahayana_gateway::{GatewayRuntime, GatewayState, ReplayLimits, RpcFailure, dispatch_request};
-use mahayana_gateway_peer::{ResolvedServerRequest, ServerRequestRegistry, ServerRequestResponse};
+use mahayana_gateway_peer::{PersistentServerRequestRegistry as ServerRequestRegistry, ResolvedServerRequest, ServerRequestResponse};
 use mahayana_gateway_protocol::{
     ApprovalRequestPayload, GatewayEvent, GatewayEventEnvelope, JsonRpcEventNotification,
 };
