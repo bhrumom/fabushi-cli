@@ -4,6 +4,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File, OpenOptions};
+#[cfg(windows)]
+use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -146,11 +148,46 @@ fn process_is_running(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        Command::new("tasklist")
+        // `tasklist` can occasionally block for minutes on Windows runners while
+        // endpoint/security services initialise. Device start/status must never
+        // inherit that unbounded wait because one-line installation calls it.
+        let mut child = match Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
-            .ok()
-            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return false;
+                    }
+                    let mut stdout = String::new();
+                    if let Some(mut pipe) = child.stdout.take() {
+                        let _ = pipe.read_to_string(&mut stdout);
+                    }
+                    return stdout.contains(&pid.to_string());
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
     }
 }
 
