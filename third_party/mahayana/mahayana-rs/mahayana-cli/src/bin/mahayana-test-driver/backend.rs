@@ -91,7 +91,7 @@ impl ProductBackend {
     fn marketplace_search(&self, params: &Value) -> Result<Value, TestDriverError> {
         let (query, platform) = marketplace_search_args(params)?;
         self.product
-            .marketplace_browse(Some(query), Some(platform))
+            .marketplace_browse(Some(query), Some(marketplace_api_platform(platform)))
             .map_err(|error| {
                 TestDriverError::new("product_backend_error", error.to_string()).with_details(
                     json!({
@@ -111,7 +111,7 @@ impl ProductBackend {
         let (plugin_id, requested_version, platform) = plugin_release_args(params)?;
         let listing = self
             .product
-            .marketplace_browse(Some(plugin_id), Some(platform))
+            .marketplace_browse(Some(plugin_id), Some(marketplace_api_platform(platform)))
             .map_err(|error| {
                 TestDriverError::new("product_backend_error", error.to_string())
                     .with_details(json!({"operation": operation.as_str(), "platform": platform}))
@@ -428,6 +428,14 @@ fn reject_inline_test_account_token(params: &Value) -> Result<(), TestDriverErro
     Ok(())
 }
 
+fn marketplace_api_platform(platform: &str) -> &str {
+    match platform {
+        "ios" | "android" => "mobile",
+        "macos" | "windows" | "linux" => "desktop",
+        other => other,
+    }
+}
+
 fn marketplace_search_args(params: &Value) -> Result<(&str, &str), TestDriverError> {
     let query = required_trimmed(
         params,
@@ -460,6 +468,17 @@ fn required_trimmed<'a>(
 mod tests {
     use super::*;
     use mahayana_plugin_runtime::InstalledPluginPointer;
+
+    #[test]
+    fn marketplace_api_platform_normalizes_concrete_platforms() {
+        assert_eq!(marketplace_api_platform("ios"), "mobile");
+        assert_eq!(marketplace_api_platform("android"), "mobile");
+        assert_eq!(marketplace_api_platform("macos"), "desktop");
+        assert_eq!(marketplace_api_platform("windows"), "desktop");
+        assert_eq!(marketplace_api_platform("linux"), "desktop");
+        assert_eq!(marketplace_api_platform("cli"), "cli");
+        assert_eq!(marketplace_api_platform("web"), "web");
+    }
 
     #[test]
     fn marketplace_search_defaults_to_ios_and_trims_query() {
